@@ -1,833 +1,1024 @@
-# DyT 替换 LayerNorm 论文 5 天提升方案
+# DyT 替换 LayerNorm 论文 5 天提升方案 (v2)
 
 ## 0. 执行摘要
 
-当前论文已经有一个有价值的问题：**Dynamic Tanh（DyT）是否可以作为 LayerNorm 的通用替代品，跨视觉架构直接使用？** 现有实验也观察到了清晰现象：DyT 在 DeiT-S/T 这类标准 global self-attention 架构上提升明显，在 Vim-T 上有收益但不稳定，在 RWKV-T、CaiT、Swin-T、ConvNeXt-T、RMT-T、Sequencer2D-S 等架构上下降或 collapse。
+### 当前论文状态
 
-当前最大问题不是实验完全不够，而是论文主线容易被审稿人认为过强：如果主张是“architecture topology predicts DyT effectiveness”，那么 CaiT、Swin、ConvNeXt、RMT 这些 open-loop 或非 recurrent 反例会削弱这个说法；Vim-T 作为 closed-loop 却有提升，RWKV-T 作为 hybrid 又可以通过 α tuning 接近 LN，也会让 topology taxonomy 显得不够稳定。
+论文题目 "How Architecture Topology Shapes Normalization-Free Network Effectiveness"，研究 Dynamic Tanh (DyT) 能否跨架构通用替代 LayerNorm。已有 10 个架构的 CIFAR-100 实验（DeiT-S/T, Vim-T, PlainMamba-T, RWKV-T, CaiT-XXS24, ConvNeXt-T, Swin-T, RMT-T, Sequencer2D-S），Tiny-ImageNet 跨数据集验证，ImageNet-100 224×224 分辨率探测，α-sensitivity sweep，RWKV key\_norm decomposition，MLP compensation ablation，effective rank 分析，CIFAR-100-C corruption robustness 等。论文数据丰富，但主线 (topology predicts DyT effectiveness) 有 4 个 open-loop 反例，claim-evidence 错位。
 
-因此，建议将论文从 **topology-centric narrative** 升级为 **normalization functional role-centric narrative**：
+### 核心问题
 
-> DyT 不能通用替代 LayerNorm，因为同样叫 LayerNorm，它在不同架构和不同位置承担的功能角色不同。DyT 比较适合替代普通 residual stream 中的 activation stabilizer，但当 normalization 承担 state-dynamics stabilizer、architectural invariant enforcer、hierarchical feature-scale controller 等角色时，直接 full replacement 会变得脆弱或失败。
+当前论文是一篇 **diagnostic paper**（"DyT 在这些架构上不 work"），但 NeurIPS 更偏好 **prescriptive paper**（"这是正确的做法，且比现有方案更好"）。论文最大的弱点不是实验不够，而是：
 
-短期 5 天内，不建议盲目扩展到大量新模型、ImageNet-1K、COCO/ADE20K 或 NLP/LM。最现实、最高 ROI 的做法是：围绕现有模型，补强 **role-aware selective replacement、RMSNorm baseline、α sensitivity、关键 ablation 多 seed、机制诊断**，把论文从“多架构现象报告”提升为“LayerNorm 功能角色决定 DyT 可替代性的系统诊断研究”。
+1. **无正向方法贡献** —— 只说了"别这么做"，没说"应该怎么做"
+2. **Topology claim 有 4 个 open-loop 反例** —— 框架解释力不够
+3. **Selective DyT 被定位为"止损"** —— 应该被定位为"Pareto 最优"
+4. **已有 appendix 数据严重低估** —— corruption robustness、α-deadlock 等独立贡献被埋没
+5. **缺 RMSNorm baseline** —— 审稿人第一个会问
+6. **32×32 尺度的实践价值有限** —— 224×224 全面失败，需要 fix 或机制解释
 
----
+### 提升策略
 
-## 1. 当前论文的主要问题
+将论文从 **topology-centric diagnostic** 升级为 **role-aware prescriptive study**，核心 story arc 为：
 
-### 1.1 当前论文已经有的优点
+> 1. 发现问题：DyT 不是 LayerNorm 的通用替代品 (cross-architecture evidence)
+> 2. 解释原因：LayerNorm 在不同位置承担不同功能角色，DyT 只能替代其中一类 (role taxonomy)
+> 3. 提出方案：Role-aware selective replacement 是 Pareto 最优——保持 clean accuracy + 提升 corruption robustness (prescriptive method)
+> 4. 揭示边界：α-deadlock 在高分辨率下的容量限制 (mechanistic depth)
+> 5. 提供工具：Early-α 诊断可在 20 epochs 内预测替换可行性 (practical tool)
 
-当前论文的优点包括：
+### 预期提升效果
 
-1. **问题重要且自然**  
-   DyT 原始工作主要验证标准 Transformer / ViT / LLM 等 global self-attention 架构，检查它能否迁移到 SSM、RWKV、hierarchical Transformer、CNN-like 视觉架构，是一个自然且有价值的问题。
-
-2. **实验现象丰富**  
-   论文不是只报告 DyT 好或不好，而是得到了一组有区分度的结果：DeiT-S/T 提升、Vim-T 部分提升、PlainMamba-T 近似持平、RWKV-T 下降、CaiT/Swin/ConvNeXt/RMT/Sequencer 明显失败。
-
-3. **已有一些有价值的机制线索**  
-   RWKV-T 的 key_norm decomposition、α sensitivity、effective rank、saturation fraction、MLP ablation 等分析都指向一个事实：LayerNorm 在不同架构中的作用并不相同。
-
-4. **负结果有实践价值**  
-   如果社区把 DyT 当成 universal drop-in replacement，这篇论文可以提醒大家：不能看到 LayerNorm 就全部替换。
-
-### 1.2 当前论文的主要风险
-
-当前论文的风险主要来自 claim 和 evidence 之间的错位。
-
-#### 风险 1：Topology claim 太强
-
-如果论文主线是：
-
-> DyT effectiveness is shaped or predicted by information-flow topology.
-
-那么审稿人会立刻看到一些反例：
-
-- DeiT 是 open-loop，DyT 有效；
-- CaiT、Swin、ConvNeXt、RMT 也不是普通 closed-loop SSM，但 DyT 失败；
-- Vim 是 closed-loop，但 DyT 在 CIFAR-100 上有效；
-- RWKV 是 hybrid，但 α=1.0 时 full DyT 可接近 LN。
-
-因此，topology 只能作为 organizing lens，不能作为单独的 causal explanation。
-
-#### 风险 2：机制解释偏 post-hoc
-
-论文中 depth-width、MLP compensation、α saturation、rank collapse、key_norm functional role 等解释都很有启发，但目前很多证据仍然是相关性或跨模型比较。审稿人可能会问：
-
-> 这些解释是事后归纳，还是经过 intervention 验证的机制？
-
-#### 风险 3：关键 ablation seed 数不足
-
-一些最支持机制 claim 的实验目前是 single-seed，例如 Vim-T ±MLP、PlainMamba-T +MLP、RMT/Sequencer collapse 等。由于 Vim-T 本身在 Tiny-ImageNet 上出现 seed-dependent sign reversal，所以 single-seed mechanism claim 很容易被质疑。
-
-#### 风险 4：α tuning 可能改变部分结论
-
-RWKV-T 在默认 α=0.5 下下降，但 α=1.0 时接近 LN。这会让审稿人质疑：
-
-> 你们观察到的失败是否只是 α 没调好？
-
-因此，α sensitivity 不能只放在附录，而应该作为主线的一部分。
-
-#### 风险 5：低分辨率 setting 的外推性不足
-
-主实验集中在 CIFAR-100 32×32 和 Tiny-ImageNet resized to 32×32，而 ImageNet-100 224×224 上 DyT 大幅失败。这个结果如果处理不好，会被视为论文主结论的弱点；如果处理得好，可以变成一个贡献：**DyT has a resolution-dependent failure mode**。
+| 维度 | 当前版本 | 提升后版本 |
+|---|---|---|
+| 主线 | Topology predicts DyT effectiveness | Normalization role determines DyT compatibility |
+| 核心贡献 | 多架构现象观察 | Role-aware selective replacement + Pareto optimality |
+| 正向方法 | 无 | Algorithm 1: Role-aware replacement protocol |
+| Baseline | 仅 LN | LN + RMSNorm |
+| 独立发现 | 无明确第二贡献 | Corruption robustness 隐式正则化 + α-deadlock 机制 |
+| 实践工具 | 无 | Early-α diagnostic + decision flowchart |
+| 反例处理 | Topology 叙事的例外 | Role taxonomy 的边界证据 |
+| NeurIPS 预估 | 15-20% | 35-45% |
 
 ---
 
-## 2. 建议的新主线：从 Topology-aware 到 Role-aware
+## 1. 当前论文分析
 
-### 2.1 新核心观点
+### 1.1 已有优点
 
-建议将论文核心观点改为：
+1. **问题重要且自然** —— DyT (Zhu et al., 2025) 原始工作验证标准 Transformer / ViT / LLM，检查跨 topology 迁移是自然延伸
+2. **实验现象丰富** —— 10 个架构，3 个结果方向（positive / near-zero / negative-or-collapse），非 trivial binary outcome
+3. **已有丰富的机制线索** —— key\_norm decomposition, α-sensitivity sweep, effective rank, MLP ablation, gradient saturation analysis, convergence speed, throughput benchmarks
+4. **Appendix 数据金矿未充分利用** —— CIFAR-100-C corruption robustness (Table 9-10), α-deadlock mechanism (Appendix K), training collapse taxonomy (Appendix O), per-layer learned α (Figure 5-6), gradient saturation (Appendix P) 都是高价值数据
+5. **实验控制规范** —— 统一 recipe，parameter-matched pairs，3 seeds for core architectures
 
-> Dynamic Tanh is not a universal LayerNorm substitute. It works when LayerNorm primarily acts as an activation stabilizer, but becomes fragile or harmful when LayerNorm plays state-dynamics, architectural-invariant, or hierarchical feature-scale roles.
+### 1.2 已有可直接复用的 Appendix 数据
 
-中文表述：
+**以下数据不需要重跑，只需在新框架下重新组织和解读：**
 
-> DyT 不是 LayerNorm 的通用替代品。它比较适合替代普通 residual stream 里的激活尺度稳定功能；但当 LayerNorm 承担状态动力学稳定、结构性不变量约束、跨 stage 特征尺度控制等功能时，直接替换会变得脆弱甚至失败。
+| 已有数据 | 位置 | 种子数 | 在新框架下的角色 |
+|---|---|---|---|
+| RWKV key\_norm decomposition | Table 2 | 3 seeds | 核心证据：architectural invariant role，structural ~65% + key\_norm ~35% |
+| CaiT SA-only ablation | §5.1 | 1 seed | 证明 24L deep SA stack 是问题根源，支持 depth-width factor |
+| α-sensitivity sweep | Table 14, Fig 8 | 1 seed × 5 arch × 4-5 α | α-stability landscape 的基础数据 |
+| Effective rank per-layer | Figure 3 | seed=42, 6 arch | 支持 tanh compression mechanism |
+| Gradient saturation | Appendix P | seed=42 | 支持 α-deadlock mechanism |
+| α-deadlock mechanism | Appendix K, Fig 7 | 3 α × 1 seed | 最强理论贡献，有数学推导 + causal chain + 实验验证 |
+| CIFAR-100-C corruption | Tables 9-10 | 3-seed mean, 2-seed per-corruption | 独立贡献：DyT 隐式正则化效果 |
+| PlainMamba-T per-seed | Table 12 | 3 seeds | Clean negative result for closed-loop |
+| Tiny-ImageNet cross-dataset | Table 4, 13 | 3 seeds × 4 arch | 跨数据集验证 |
+| Training collapse taxonomy | Appendix O | multiple | 3 种 failure mode 分类 |
+| PlainMamba-Wide collapse | §5.3 | 3 seeds | MLP compensation 必要不充分 |
+| Convergence speed | Table 6 | 3 seeds | DyT 加速收敛但不影响 peak |
+| Throughput / efficiency | Tables 7-8 | — | 计算开销分析 |
+| ImageNet-100 probe | Table 11, Fig 6 | 3 α | 224×224 容量限制 |
+| ConvNeXt-T probe | Appendix E | 3 seeds | Pre-norm pattern 外架构失败 |
+| Per-layer learned α | Figure 5 | seed=42 | 可用于验证 role taxonomy 的非循环证据 |
+| MLP ablation | Table 3 | 1 seed | Vim-T ±MLP, PlainMamba-T +MLP |
 
-### 2.2 新概念框架：Normalization Functional Roles
+### 1.3 主要风险
 
-建议将 LayerNorm 的功能角色分成四类：
+#### 风险 1：正向贡献不足（最严重）
 
-| Functional role | 含义 | 代表模型/位置 | DyT 兼容性 | 主要风险 |
-|---|---|---|---|---|
-| Activation stabilizer | 稳定 residual stream 的激活尺度 | DeiT / ViT pre-norm | 高 | α 过大时 tanh saturation |
-| State-dynamics stabilizer | 稳定 SSM / recurrent state update 的输入和状态传播 | Vim / Mamba state-adjacent norms | 中等，α 敏感 | 状态递推放大尺度误差 |
-| Architectural invariant enforcer | 维持结构性约束，如 key magnitude | RWKV key_norm / QK norm-like sites | 低 | 破坏 attention/key scale 机制 |
-| Hierarchical feature-scale controller | 管理多 stage / 多分辨率特征尺度 | ConvNeXt LN2d、Swin stage/downsample norms | 低 | 跨 stage 尺度漂移、rank collapse |
+审稿人核心评价会是："Interesting observations but no method contribution." 仅报告负结果不够 NeurIPS，必须有 prescriptive takeaway。
 
-### 2.3 新主线如何解释现有结果
+#### 风险 2：Topology claim 与数据不符
 
-#### DeiT-S/T：DyT 成功案例
+4 个 open-loop 反例 (CaiT -12.34, Swin -17.18, ConvNeXt -12.11, RMT collapse) 直接驳斥 "open-loop ⇒ DyT works"。Topology 只能作为 organizing lens，不能作为 predictor。
 
-DeiT 中的 LayerNorm 主要是 standard residual pre-norm activation stabilizer。DyT 的 tanh 压缩可以在一定范围内替代这种尺度稳定作用，并可能带来 regularization，因此 DeiT-S/T 获得明显提升。
+#### 风险 3：32×32 尺度限制实践价值
 
-#### Vim-T：DyT 有效但脆弱
+ImageNet-100 224×224 上 DyT 全面失败 (-18 pp)。审稿人会问："谁会在 32×32 上部署？" 必须提供机制解释或 fix。
 
-Vim-T 里的 norm 不只是 activation stabilizer，还靠近 SSM state update。DyT 可以部分替代，但对 α 和初始化非常敏感，稳定窗口窄。因此 CIFAR-100 上有收益，但 Tiny-ImageNet 上出现 seed-dependent sign reversal。
+#### 风险 4：机制解释偏 post-hoc
 
-#### PlainMamba-T：接近中性或无收益
+Depth-width, MLP compensation, α saturation 等解释是事后归纳。需要 intervention evidence 或 non-circular diagnostic。
 
-PlainMamba-T 缺少 MLP compensation，并且 scan / state update 机制不同。DyT 的有界压缩难以被其他通道补偿，因此收益不明显。
+#### 风险 5：缺 RMSNorm baseline
 
-#### RWKV-T：functional norm mismatch
+审稿人第一个问题："DyT 的好处是否只是因为 LN 的 mean-centering 不必要？" RMSNorm 是最自然的控制条件。
 
-RWKV 的 key_norm 不是普通 activation norm，而是 architecture-specific invariant，用于控制 key magnitude。DyT 作为 pointwise tanh 不能等价替代这个约束，因此 full replacement 下降。保留 key_norm 后性能恢复一部分，正好支持 functional role 框架。
+#### 风险 6：关键 ablation seed 数不足
 
-#### CaiT / Swin / ConvNeXt / RMT：边界和失败模式
-
-这些模型不是简单的 DeiT-like global self-attention。CaiT 的深窄 attention stack 容易积累 tanh compression；Swin 和 ConvNeXt 的 normalization 与 hierarchical stage / feature-scale control 强绑定；RMT / Sequencer 的 retention 或 recurrent 机制对 bounded pointwise replacement 更敏感。因此这些失败不是 topology 叙事的例外，而是 role-aware 框架下的边界证据。
+Vim-T ±MLP, PlainMamba-T +MLP, α-sensitivity sweep, CaiT SA-only ablation 等均为 single-seed。
 
 ---
 
-## 3. 新论文贡献点建议
+## 2. 新主线设计
 
-建议将贡献点重写为：
+### 2.1 核心论点
 
-1. **Functional role perspective for normalization replacement**  
-   We show that LayerNorm modules with the same mathematical form can play different architectural roles, including activation stabilization, recurrent-state stabilization, architectural invariant enforcement, and hierarchical feature-scale control.
+> LayerNorm 在现代架构中承担的功能角色不同。Role-aware selective DyT replacement——在 activation-stabilizer sites 用 DyT，其余保持 LN——不仅比 full DyT 更安全，还能实现比 full LN 更好的 clean-robustness trade-off，因为 DyT 在适当位置提供隐式正则化。
 
-2. **Cross-architecture evidence that DyT is not a universal replacement**  
-   Across standard self-attention, SSM, RWKV-like hybrid, hierarchical Transformer, and CNN-like architectures, DyT succeeds, becomes fragile, or fails depending on the normalization role.
+关键转变：Selective DyT 不是"止损"（recover from full DyT degradation），而是 **"Pareto 最优"**（同时优于 full LN 和 full DyT）。
 
-3. **Role-aware selective replacement**  
-   We propose and evaluate a simple role-aware replacement principle: replace generic residual pre-norm activation stabilizers, but preserve state-critical, key/query-critical, and stage-transition normalization sites.
+### 2.2 Normalization Functional Role Taxonomy
 
-4. **Mechanistic diagnostics and α-stability landscape**  
-   Through α sweeps, key_norm decomposition, state/activation norm analysis, saturation ratio, and effective-rank diagnostics, we identify why full DyT replacement fails in specific architectures.
+四类功能角色，**基于 norm 在计算图中的位置（非循环定义）**：
+
+| Functional role | 位置判断标准 | 代表位置 | DyT 兼容性 |
+|---|---|---|---|
+| **Activation stabilizer** | Residual stream pre-norm (pre-attn, pre-FFN) | DeiT/ViT 的 norm1, norm2 | 高 |
+| **State-dynamics stabilizer** | SSM/recurrent state transition 路径上 | Vim 的 state-adjacent norms | 中，α-sensitive |
+| **Architectural invariant enforcer** | Key/Query/专用 functional norm | RWKV key\_norm, QK-norm | 低 |
+| **Hierarchical feature-scale controller** | Downsample / stage transition / patch merging | ConvNeXt LN2d, Swin patch-merging | 低 |
+
+**非循环性保证**：分类标准完全基于 norm 在计算图中的结构位置，不依赖 DyT 替换后的表现。
+
+### 2.3 Role Taxonomy 的独立验证
+
+除了 selective replacement intervention，还通过以下非循环证据验证：
+
+1. **Per-layer learned α correlation** —— 不同 role 的 norm sites 是否学到不同的 α 分布（从现有 checkpoint 分析，零成本）
+2. **Activation distribution comparison** —— DyT 在不同 role sites 的输出分布是否近似 LN（从现有 checkpoint 分析，零成本）
+3. **RMSNorm 作为控制实验** —— 如果 RMSNorm 在所有 sites 都接近 LN，说明问题是 tanh 特有的；如果 RMSNorm 也显示 role-dependent pattern，说明 role dependency 是 normalization replacement 的一般性质
+
+### 2.4 新主线如何解释所有结果
+
+| Architecture | 主要 norm role | DyT Δ (pp) | 解释 |
+|---|---|---|---|
+| DeiT-S | Activation stabilizer (12L/384) | +6.90 | Wide buffer absorbs tanh compression; DyT provides implicit regularization |
+| DeiT-T | Activation stabilizer (12L/192) | +3.91 | Narrower width reduces buffer; same direction, smaller magnitude |
+| Vim-T | Activation + state-dynamics | +3.45 | Bidirectional scan enables global aggregation; MLP compensates; but α-fragile |
+| PlainMamba-T | State-dynamics (no MLP) | -0.41 | No MLP compensation; unidirectional scan lacks global context |
+| RWKV-T | Activation + architectural invariant | -2.17 | key\_norm site incompatible with DyT; structural norms account for ~65% |
+| CaiT-XXS24 | Activation in deep-narrow stack | -12.34 | 24L SA stack accumulates tanh compression beyond d=192 buffer |
+| ConvNeXt-T | Hierarchical scale controller | -12.11 | Post-depthwise LN manages cross-stage feature scales |
+| Swin-T | Hierarchical + windowed | -17.18 | Patch-merging norms control resolution transitions; windowed attn lacks global stats |
+| RMT-T | Activation + retention mechanism | collapse | Retention mechanism requires precise norm behavior |
+| Sequencer2D-S | State-dynamics (BiLSTM) | collapse | BiLSTM recurrence amplifies bounded DyT errors |
+
+---
+
+## 3. 新论文贡献点
+
+### Contribution 1: Role-aware selective replacement as Pareto-optimal strategy
+
+> We propose role-aware selective DyT replacement — replacing activation-stabilizer norms with DyT while preserving architecture-critical norms as LN. This achieves **Pareto optimality**: matching full LN on clean accuracy while surpassing it on corruption robustness.
+
+支撑证据：selective DyT Pareto 分析 (新实验) + CIFAR-100-C evaluation (部分已有)
+
+### Contribution 2: Cross-architecture evidence with role taxonomy
+
+> Across 10 architectures spanning 5 topology types, we show that DyT effectiveness is governed by the functional role of each normalization site — not by architecture topology alone. The role taxonomy, defined by computational graph position, provides non-circular classification.
+
+支撑证据：Table 1 (已有) + RMSNorm baseline (新实验) + per-layer α correlation (零成本分析)
+
+### Contribution 3: DyT as implicit regularizer
+
+> DyT universally improves corruption robustness across all tested architectures (+2.73 to +6.79 pp), including RWKV-T where clean accuracy decreases. DyT's bounded activation range provides distribution-shift regularization independent of in-distribution performance.
+
+支撑证据：CIFAR-100-C Tables 9-10 (已有数据) + selective DyT corruption eval (新实验)
+
+### Contribution 4: α-deadlock mechanism and resolution boundary
+
+> We identify a resolution-dependent failure mode: at 224×224, tanh saturation creates a self-reinforcing α-deadlock (sech²(αx) → 0 suppresses both signal and parameter gradients), establishing a capacity boundary that no α tuning can resolve.
+
+支撑证据：Appendix K 数学推导 + Figure 7 causal chain + Table 11 实验 (全部已有)
+
+### Contribution 5: Practical diagnostic toolkit
+
+> We provide an early-α diagnostic: monitoring per-site learned α during the first 20 training epochs predicts replacement feasibility, enabling practitioners to apply DyT safely without exhaustive validation.
+
+支撑证据：α trajectory 分析 (从现有 training log 提取) + 验证实验
 
 ---
 
 ## 4. 新标题建议
 
-不建议继续使用过强的 topology-centric 标题。推荐以下标题之一：
+保留 topology 作为 organizing lens，加入 role 作为核心：
 
-1. **When Can Dynamic Tanh Replace LayerNorm? A Role-Aware Study Across Vision Architectures**
-2. **Beyond Drop-in Replacement: Functional Roles of LayerNorm Shape Dynamic Tanh Effectiveness**
-3. **Dynamic Tanh Is Not a Universal LayerNorm Substitute: Evidence from State-Space, Hybrid, and Hierarchical Vision Models**
-4. **The Functional Role of Normalization Determines Whether Dynamic Tanh Works**
-
-最推荐第 1 个或第 2 个。它们表达了问题意识，又避免过度承诺 topology 可以 predict 一切。
+1. **When Can Dynamic Tanh Replace LayerNorm? A Role-Aware Analysis Across Vision Architectures** （推荐）
+2. **Beyond Drop-in Replacement: Normalization Roles Determine Dynamic Tanh Effectiveness**
+3. **Role-Aware Normalization Replacement: Why Dynamic Tanh Works for Some Sites but Not Others**
 
 ---
 
-## 5. 5 天内最优实验策略
+## 5. 实验计划
 
-### 5.1 基本原则
+### 5.1 资源估算
 
-在 5 天 + 2–4 张 RTX 5090 的约束下，实验目标不是做成终极 benchmark，而是补上最容易被审稿人攻击的短板：
+**训练时间（RTX 5090, CIFAR-100 100 epochs）：**
 
-1. full DyT replacement 没有正向方案；
-2. 缺 RMSNorm 等强 baseline；
-3. α tuning 可能改变结论；
-4. 关键 mechanism ablation seed 数不足；
-5. 机制分析仍偏 post-hoc；
-6. 低分辨率结果外推性不足。
+| Architecture | Params | 估计时间/run |
+|---|---|---|
+| DeiT-T | 5.4M | ~25 min |
+| RWKV-T | 5.8M | ~30 min |
+| CaiT-XXS24 | 11.6M | ~45 min |
+| PlainMamba-T | 12.1M | ~50 min |
+| DeiT-S | 22M | ~60 min |
+| Vim-T | 22M | ~75 min |
+| Swin-T | 27.6M | ~80 min |
+| ConvNeXt-T | 27.9M | ~80 min |
 
-因此，短期最应该做的是：
+**GPU 容量：** 4 × RTX 5090 × 5 天 × ~20 有效小时/天 = ~400 GPU-hours ≈ **350-450 CIFAR-100 runs**
 
-> Role-aware selective replacement + RMSNorm baseline + α sensitivity + key mechanism ablation 3 seeds + targeted diagnostics.
+### 5.2 总实验量概览
 
-不建议短期主攻：
+| 实验组 | 优先级 | 新增 runs | 目的 |
+|---|---|---|---|
+| E1: RMSNorm baseline 全架构 | P0 | 21-24 | 消除 mean-centering 攻击 + role hypothesis 控制 |
+| E2: RWKV-T selective replacement + Pareto | P0 | 12-15 | 核心方法贡献 |
+| E3: Vim-T selective replacement + α | P0 | 12-15 | State-dynamics role 验证 |
+| E4: DeiT-S/T α 补 seeds | P0 | 8-12 | Activation stabilizer role 完善 |
+| E5: DyT-v2 variants at 224×224 | P0 | 6-12 | 突破 scale 天花板尝试 |
+| E6: Vim ±MLP 补 seeds | P1 | 8 | MLP compensation multi-seed |
+| E7: ConvNeXt-T selective replacement | P1 | 9-12 | Hierarchical role 验证 |
+| E8: Swin-T selective replacement | P1 | 9-12 | Hierarchical role 验证 |
+| E9: CaiT depth threshold ablation | P1 | 4-8 | Depth-width factor 验证 |
+| E10: PlainMamba-T +MLP 补 seeds | P1 | 4 | MLP grafting multi-seed |
+| E11: Selective DyT CIFAR-100-C eval | P1 | 0 (eval only) | Pareto clean+corruption 验证 |
+| E12: Tiny-ImageNet selective + RMSNorm | P2 | 18-27 | 跨数据集验证 |
+| E13: Resolution continuum (64, 128) | P2 | 4-8 | α-deadlock resolution curve |
+| E14: 核心实验 5-seed 扩展 | P2 | 30-40 | 统计显著性 |
+| A1: Per-layer α ↔ role correlation | P0 | 0 (分析) | 非循环 taxonomy 验证 |
+| A2: Activation distribution comparison | P0 | 0 (分析) | Role taxonomy 可视化 |
+| A3: Depth-width scaling formula | P1 | 0 (分析) | 理论深度 |
+| A4: Early-α diagnostic validation | P1 | 0 (分析) | 实践工具 |
+| A5: Zhu et al. recipe 对比研究 | P1 | 1-3 (可选) | 解释 224×224 矛盾 |
 
-- ImageNet-1K 完整训练；
-- COCO / ADE20K；
-- 10–20 个新模型；
-- NLP / LM 扩展；
-- fused DyT kernel；
-- 10 seeds 全矩阵。
+**总计新增训练：P0 ≈ 60-80 runs, P0+P1 ≈ 110-150 runs, P0+P1+P2 ≈ 160-225 runs**
 
----
-
-## 6. 短期实验优先级
-
-## S1. RWKV-T role-aware selective replacement
-
-### 优先级
-
-最高。
-
-### 目的
-
-把 RWKV 从“DyT 在 hybrid 上失败”的个例，升级成“architectural invariant norm 不能被 pointwise DyT 替代”的核心证据。
-
-### 实验配置
-
-建议跑以下配置：
-
-| 配置 | 目的 |
-|---|---|
-| Full LN | 原始 baseline |
-| Full DyT α=0.5 | 默认 full replacement |
-| Full DyT best α | 回应 α tuning 质疑 |
-| DyT preserving key_norm | 已有 key_norm 证据，建议补齐 seeds |
-| Role-aware DyT preserving key_norm + other functional norms | 验证 role-aware replacement |
-| RMSNorm full replacement | 强 baseline |
-
-### Seed 数
-
-- 最低：3 seeds；
-- 理想：5 seeds；
-- 如果时间紧，优先保证 Full LN / Full DyT / key_norm-preserved / role-aware DyT / RMSNorm 的 3 seeds。
-
-### 预期论文结论
-
-如果 role-aware DyT 明显优于 full DyT，可以写：
-
-> Preserving architecture-functional normalization sites recovers a substantial fraction of the full-DyT degradation, showing that DyT should not be applied by module name alone.
-
-如果 role-aware DyT 仍然不如 LN，也仍然有价值：
-
-> The remaining gap indicates that RWKV’s incompatibility is not solely due to key_norm, but preserving functional norms consistently improves robustness over blanket replacement.
+**GPU 利用率：P0+P1+P2 ≈ 45-65%，留有充足的失败重跑和追加空间**
 
 ---
 
-## S2. Vim-T α sensitivity + selective replacement
+## 6. 实验详细设计
 
-### 优先级
+### E1: RMSNorm Baseline 全架构
 
-最高。
+**优先级：P0（最高）**
 
-### 目的
+**目的：** 不仅是 baseline，更是 role hypothesis 的控制实验。RMSNorm 去掉了 LN 的 mean-centering 但保留了统计 normalization 的 rescaling 能力。如果 RMSNorm 在所有架构上都接近 LN，说明问题是 tanh 的 bounded output range 特有的。如果 RMSNorm 也显示 role-dependent pattern，说明 role dependency 是 normalization replacement 的一般性质。无论哪种结果都对论文有利。
 
-修复 closed-loop 结论不稳的问题，把 Vim-T 从“closed-loop 也能提升”的单点结果，改写成“state-dynamics normalization makes DyT fragile and α-sensitive”。
+**配置：**
 
-### 实验配置
+| Architecture | Seeds | Runs |
+|---|---|---|
+| DeiT-S | 3 | 3 |
+| DeiT-T | 3 | 3 |
+| Vim-T | 3 | 3 |
+| RWKV-T | 3 | 3 |
+| PlainMamba-T | 3 | 3 |
+| ConvNeXt-T | 3 | 3 |
+| Swin-T | 3 | 3 |
 
-| 配置 | 目的 |
-|---|---|
-| LN | baseline |
-| Full DyT α=0.25 | 小 α，检查 near-linear regime |
-| Full DyT α=0.5 | 默认 DyT |
-| Full DyT α=1.0 | 检查 saturation / collapse |
-| Role-aware DyT preserving state-adjacent norms | 验证 state-critical norms |
-| DyT only non-state / MLP-side norms | 检查哪些位置可替 |
-| RMSNorm | 强 baseline |
+**Total: 21 runs ≈ 1 GPU-day**
 
-### Seed 数
+**分析框架：** 结果按 role 分组而非按 architecture 分组，检查 RMSNorm 是否也显示 role-dependent pattern。
 
-- CIFAR-100：3 seeds；
-- Tiny-ImageNet：如果时间充裕，只补 LN / Full DyT / Role-aware DyT / RMSNorm 的 3 seeds。
+### E2: RWKV-T Role-Aware Selective Replacement + Pareto Analysis
 
-### 可选但很有价值
+**优先级：P0（最高）**
 
-如果代码支持，补 Vim-T ±MLP 的 3 seeds：
+**目的：** 把 RWKV-T 从 "DyT 在 hybrid 上失败" 升级为 role-aware replacement 的核心 showcase。关键目标是展示 **Pareto optimality**：selective DyT 的 clean accuracy ≈ LN 且 corruption robustness > LN。
 
-| 配置 | 目的 |
-|---|---|
-| Vim-T full + LN/DyT | 对照 |
-| Vim-T -MLP + LN/DyT | 验证 MLP compensation |
+**配置（CIFAR-100）：**
 
-### 预期论文结论
+| 配置 | 替换比例 | 目的 | Seeds |
+|---|---|---|---|
+| Full LN | 0% DyT | Baseline | 已有 3 seeds |
+| Full DyT α=0.5 | 100% DyT | Default full replacement | 已有 3 seeds |
+| Full DyT α=1.0 | 100% DyT | Best α full replacement | 已有 (alpha-rwkv-a100) |
+| DyT (excl. key\_norm) | ~80% DyT | Key\_norm preserved | 已有 3 seeds (Table 2) |
+| **Selective DyT: only residual pre-norm** | ~50% DyT | Role-aware replacement | **新, 3 seeds** |
+| **Selective DyT: residual pre-norm + α=0.25** | ~50% DyT | Role-aware + conservative α | **新, 3 seeds** |
+| **RMSNorm full** | 0% DyT | Strong baseline | **新, 3 seeds (E1)** |
 
-> In SSM-style architectures, DyT can sometimes replace LayerNorm, but the replacement is narrowly conditioned on α and on whether state-critical normalization sites are preserved.
+已有数据：Full LN (3 seeds), Full DyT α=0.5 (3 seeds), DyT excl. key\_norm (3 seeds), Full DyT α=1.0 (1 seed)
+**新增 runs: 6-9**（selective DyT 两种配置 × 3 seeds，RMSNorm 已在 E1 中计）
 
----
+**CIFAR-100-C evaluation（E11，零训练成本）：**
+对所有 converged checkpoints 跑 CIFAR-100-C evaluation，构建 Pareto 曲线：
+- x-axis: Clean accuracy
+- y-axis: Mean corruption accuracy
+- 每个点对应一种 normalization 配置
 
-## S3. DeiT-S/T RMSNorm baseline + α robustness
+**预期结论：**
 
-### 优先级
+最佳情况：
+> Selective DyT (only residual pre-norms replaced) matches full LN on clean accuracy while surpassing it on corruption robustness by +X pp, achieving Pareto optimality.
 
-很高。
+次佳情况：
+> Selective DyT substantially recovers the full-DyT degradation and preserves corruption robustness gains, demonstrating that role-aware replacement is strictly superior to blanket replacement.
 
-### 目的
+### E3: Vim-T Selective Replacement + α Sensitivity
 
-DeiT 是 DyT 成功案例。需要证明 DyT 不只是比 LayerNorm 好，还要和 RMSNorm 这种强替代 baseline 对比。
+**优先级：P0**
 
-### 实验配置
+**目的：** 验证 state-dynamics role，展示 selective DyT 在 SSM 上拓宽 α stability window。
 
-对 DeiT-S 和 DeiT-T 跑：
+**配置（CIFAR-100）：**
 
-| 配置 | 目的 |
-|---|---|
-| LN | baseline |
-| Full DyT α=0.25 | 小 α |
-| Full DyT α=0.5 | 默认 DyT |
-| Full DyT α=1.0 | saturation risk |
-| RMSNorm | 强 baseline |
+| 配置 | 目的 | Seeds |
+|---|---|---|
+| Full LN | Baseline | 已有 3 seeds |
+| Full DyT α=0.5 | Default | 已有 3 seeds |
+| Full DyT α=0.25 | Small α | 已有 1 seed, **补 2 seeds** |
+| Full DyT α=1.0 | Saturation risk | 已有 1 seed (collapsed), **补 2 seeds** |
+| **Selective DyT: preserve state-adjacent norms** | Role-aware | **新, 3 seeds** |
+| **Selective DyT: only pre-FFN norms** | Minimal replacement | **新, 3 seeds** |
+| **RMSNorm full** | Strong baseline | **E1 中已计** |
 
-### Seed 数
+**新增 runs: 10-13**
 
-3 seeds 即可。
+**CIFAR-100-C evaluation：** 对 selective DyT checkpoints 跑 corruption eval，检查 robustness gain 是否保留。
 
-### 预期论文结论
+### E4: DeiT-S/T α Robustness 补 Seeds
 
-> Standard pre-norm global self-attention is the cleanest case where DyT can replace activation-stabilizing LayerNorm. Its α-stability range is wider than that of state-dynamics architectures.
+**优先级：P0**
 
----
+**目的：** 确认 activation-stabilizer role 的 α stability window 比 state-dynamics role 更宽。
 
-## S4. ConvNeXt-T 或 Swin-T selective replacement
+**配置：**
 
-### 优先级
-
-中高。
-
-### 目的
-
-证明 open-loop 不是充分条件，hierarchical / stage-related normalization 不能 blanket replacement。
-
-### ConvNeXt-T 配置
-
-| 配置 | 目的 |
-|---|---|
-| Full LN | baseline |
-| Full DyT | 复现大幅失败 |
-| DyT shallow stages only | 检查浅层是否可替 |
-| DyT within-stage only | 检查 stage 内替换 |
-| Preserve downsampling/stage-transition norms | 验证 hierarchical feature-scale role |
-| RMSNorm | 可选 baseline |
-
-### Swin-T 配置
-
-| 配置 | 目的 |
-|---|---|
-| Full LN | baseline |
-| Full DyT | 复现失败 |
-| Preserve patch-merging / stage-boundary norms | 验证 stage transition role |
-| Block-internal DyT only | 检查普通 block norm 可替性 |
-| RMSNorm | 可选 baseline |
-
-### Seed 数
-
-- 最低：1 seed diagnostic；
-- 更好：3 seeds。
-
-### 预期论文结论
-
-> Hierarchical architectures contain normalization sites that control feature-scale transitions across stages. Full DyT replacement disrupts these roles, while preserving stage-critical norms can partially recover the gap.
-
----
-
-## S5. 机制诊断分析
-
-### 优先级
-
-高。
-
-### 目的
-
-让 functional role taxonomy 不是纯叙事，而有机制证据支撑。
-
-### 必做诊断 1：RWKV key magnitude / WKV scale
-
-分析：
-
-- key vector norm distribution；
-- WKV attention weights / logits scale；
-- key_norm preserved vs replaced 的差异；
-- Full DyT 与 role-aware DyT 的 key magnitude drift。
-
-支持结论：
-
-> key_norm enforces an architectural invariant that pointwise tanh does not preserve.
-
-### 必做诊断 2：Vim state norm / state update input norm
-
-分析：
-
-- SSM state input norm；
-- hidden state norm across depth/tokens；
-- 不同 α 下 state norm 是否发散或塌缩；
-- role-aware preserving state-adjacent norm 是否更稳定。
-
-支持结论：
-
-> State-dynamics stabilizing norms are more α-sensitive than ordinary activation stabilizers.
-
-### 必做诊断 3：DyT saturation ratio / effective rank
-
-分析：
-
-- tanh saturation fraction；
-- per-layer effective rank；
-- α 与 saturation / rank / accuracy 的关系；
-- 成功模型和失败模型的对比。
-
-支持结论：
-
-> DyT failure often coincides with tanh saturation and representation compression, especially in deep/narrow or hierarchical settings.
-
----
-
-## S6. 可选实验：ViT-Tiny 或 resolution diagnostic
-
-### ViT-Tiny
-
-如果 timm pipeline 已经成熟，可以加一个低风险模型：
-
-| 配置 | 目的 |
-|---|---|
-| LN | baseline |
-| Full DyT | 检查 DeiT 是否个例 |
-| RMSNorm | baseline |
-
-3 seeds，CIFAR-100 即可。
-
-### Resolution diagnostic
-
-如果 ImageNet-100 或 resize pipeline 已经 ready，可以对 DeiT-S/T 做：
-
-| Resolution | 配置 |
-|---|---|
-| 32×32 | LN / DyT |
-| 64×64 | LN / DyT |
-| 128×128 | LN / DyT |
-| 224×224 | LN / DyT |
-
-记录：
-
-- DyT - LN accuracy；
-- saturation ratio；
-- effective rank；
-- activation norm。
-
-预期结论：
-
-> DyT benefit decreases as resolution increases, suggesting a resolution-dependent saturation failure mode.
-
----
-
-## 7. 5 天执行计划
-
-### Day 0：重构叙事与实验代码
-
-#### 写作任务
-
-1. 重写 abstract skeleton；
-2. 重写 introduction skeleton；
-3. 新增 “Normalization Functional Roles” 小节；
-4. 新增 “Role-aware Replacement Protocol” 小节；
-5. 设计新主表模板。
-
-#### 代码任务
-
-1. 支持按 norm site selective replacement；
-2. 支持 RMSNorm 替换；
-3. 支持 α grid；
-4. 支持自动记录 saturation ratio / activation norm；
-5. 支持自动导出 CSV 和图表。
-
----
-
-### Day 1：启动最高优先级实验
-
-#### GPU 1：RWKV-T selective replacement
-
-- Full LN；
-- Full DyT α=0.5；
-- Full DyT best α；
-- DyT preserving key_norm；
-- Role-aware DyT；
-- RMSNorm。
-
-#### GPU 2：Vim-T α sensitivity
-
-- LN；
-- DyT α=0.25/0.5/1.0；
-- Role-aware DyT；
-- RMSNorm。
-
-#### GPU 3：DeiT-S/T RMSNorm + α robustness
-
-- DeiT-S：LN / DyT α=0.25/0.5/1.0 / RMSNorm；
-- DeiT-T：LN / DyT α=0.25/0.5/1.0 / RMSNorm。
-
-#### GPU 4：ConvNeXt/Swin selective or Vim ±MLP
-
-优先级：
-
-1. Vim ±MLP 3 seeds；
-2. ConvNeXt selective replacement；
-3. Swin selective replacement。
-
----
-
-### Day 2：继续多 seed + 开始机制分析
-
-#### 训练任务
-
-1. 补齐 RWKV-T 关键配置 3 seeds；
-2. 补齐 Vim-T 关键配置 3 seeds；
-3. 补齐 DeiT RMSNorm / α 的 3 seeds；
-4. 若有余力，开始 ConvNeXt/Swin selective。
-
-#### 分析任务
-
-1. 提取 RWKV key magnitude；
-2. 提取 Vim state norm；
-3. 提取 DyT saturation ratio；
-4. 初步生成 alpha stability plot。
-
----
-
-### Day 3：补强边界实验和诊断图
-
-#### 实验任务
-
-1. ConvNeXt-T selective replacement；
-2. Swin-T selective replacement，如果 ConvNeXt 已完成；
-3. ViT-Tiny 或 resolution diagnostic，可选；
-4. 对 collapse 或异常结果重跑。
-
-#### 写作任务
-
-1. 写 Results 1：Cross-architecture outcomes；
-2. 写 Results 2：Role-aware selective replacement；
-3. 写 Results 3：α-stability landscape；
-4. 写 Results 4：Mechanistic diagnostics。
-
----
-
-### Day 4：论文重写日
-
-#### 主文重构
-
-建议主文结构改为：
-
-1. Introduction；
-2. Related Work；
-3. Functional Roles of Normalization；
-4. Role-aware DyT Replacement Protocol；
-5. Experimental Setup；
-6. Cross-Architecture Results；
-7. Role-aware Selective Replacement；
-8. α-stability and Failure Modes；
-9. Mechanistic Diagnostics；
-10. Limitations；
-11. Conclusion。
-
-#### 图表整理
-
-主文建议保留 4–5 张关键图表：
-
-1. 主结果表：LN / RMSNorm / Full DyT / Role-aware DyT；
-2. Functional role taxonomy table；
-3. Selective replacement recovery figure；
-4. α stability landscape；
-5. Mechanism figure：key norm / state norm / saturation。
-
----
-
-### Day 5：压力测试和最终润色
-
-#### Reviewer attack list
-
-让 agent 模拟 NeurIPS reviewer，重点攻击：
-
-1. topology claim 是否过强；
-2. role taxonomy 是否 post-hoc；
-3. selective replacement 是否 cherry-pick；
-4. α tuning 是否解释了所有结果；
-5. RMSNorm baseline 是否充分；
-6. low-resolution setting 是否限制结论；
-7. seed 数是否足够；
-8. 是否存在 best test leakage。
-
-#### Claim-evidence audit
-
-逐条检查论文中的强 claim 是否有表/图支持：
-
-| Claim | 需要支持的证据 |
-|---|---|
-| DyT works for activation stabilizer role | DeiT + RMSNorm + α robustness |
-| State-dynamics norms are α-sensitive | Vim α sweep + state norm |
-| key_norm is architectural invariant | RWKV key_norm / role-aware ablation |
-| hierarchical stage norms should be preserved | ConvNeXt/Swin selective |
-| full replacement is inferior to role-aware replacement | selective replacement table |
-| saturation/rank compression explains failures | saturation + effective rank |
-
-没有充分证据的句子，全部改成：
-
-- “suggests”；
-- “is consistent with”；
-- “provides evidence that”；
-- “within the tested settings”。
-
----
-
-## 8. 新主表和新图表设计
-
-### Table 1：Main results with stronger baselines
-
-| Model | Role class | LN | RMSNorm | Full DyT | Role-aware DyT | Best α DyT | Δ Full DyT | Δ Role-aware |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| DeiT-S | Activation stabilizer | | | | | | | |
-| DeiT-T | Activation stabilizer | | | | | | | |
-| Vim-T | State-dynamics stabilizer | | | | | | | |
-| RWKV-T | Architectural invariant | | | | | | | |
-| ConvNeXt-T | Hierarchical scale controller | | | | | | | |
-
-### Table 2：Functional role taxonomy
-
-| Functional role | Norm sites | Representative models | Full DyT behavior | Role-aware recommendation |
+| Architecture | α | 当前 seeds | 补 seeds | 新增 runs |
 |---|---|---|---|---|
-| Activation stabilizer | residual pre-norm | DeiT/ViT | often works | replace |
-| State-dynamics stabilizer | SSM/state-adjacent norms | Vim/Mamba | fragile | tune α or preserve |
-| Architectural invariant | key_norm/QK-like norms | RWKV | harmful | preserve |
-| Hierarchical scale controller | stage/downsample norms | Swin/ConvNeXt | harmful | preserve stage-critical norms |
+| DeiT-S | 0.25 | 1 | +2 | 2 |
+| DeiT-S | 1.0 | 1 (degraded) | +2 | 2 |
+| DeiT-T | 0.25 | 0 | +3 | 3 |
+| DeiT-T | 1.0 | 0 | +3 | 3 |
 
-### Figure 1：Outcome map
+**新增 runs: 10**（RMSNorm 已在 E1 中计）
 
-展示不同模型的 DyT - LN accuracy，颜色表示 functional role，形状表示 full DyT / role-aware DyT。
+### E5: DyT-v2 Variants at 224×224（Scale 天花板突破尝试）
 
-### Figure 2：Selective replacement recovery
+**优先级：P0（成本极低，upside 最大）**
 
-对 RWKV、Vim、ConvNeXt/Swin：
+**目的：** α-deadlock 的根本原因是 tanh 的 bounded output range [-1, 1]。测试简单 fix 能否在 224×224 上缩小 18 pp gap。即使失败也是有价值的负结果。
 
-```text
-LN baseline
-Full DyT
-Role-aware DyT
-RMSNorm
+**Variants：**
+
+| Variant | 公式 | 解决什么问题 |
+|---|---|---|
+| DyT-Res | γ·tanh(αx) + β + x | 加 residual bypass，unbounded output |
+| DyT-Clamp | γ·tanh(αx) + β, α clamped ≤ 0.5 | 硬约束防止 α-deadlock |
+| DyT-Warmup | α\_init=0.01, linear warmup 20 epochs → 0.5 | 避免 early saturation |
+
+**配置：** ImageNet-100 224×224, DeiT-S, 1 seed each
+
+| Config | LN baseline | 对比 |
+|---|---|---|
+| LN | 70.6% | — |
+| DyT α=0.1 (best current) | 52.3% | Δ = -18.3 |
+| DyT-Res α=0.1 | ? | 目标：缩小 gap |
+| DyT-Res α=0.5 | ? | 目标：缩小 gap |
+| DyT-Clamp α=0.5 | ? | 目标：避免 deadlock |
+| DyT-Warmup α→0.5 | ? | 目标：避免 early saturation |
+
+**新增 runs: 4-6**（每 run ~2-4 小时，总计 ~1 GPU-day）
+
+**预期分析：**
+
+如果任何 variant 显著改善（例如 >60%）：
+> We identify the failure mode (α-deadlock) and show that a simple fix (e.g., residual bypass) partially addresses it, opening a path for DyT at higher resolutions.
+
+如果全部失败：
+> The capacity limitation persists across multiple mitigation strategies, confirming that the bounded tanh output range is a fundamental constraint of pointwise normalization substitution.
+
+### E6: Vim-T ±MLP 补 Seeds
+
+**优先级：P1**
+
+**配置：**
+
+| Config | 当前 seeds | 补 seeds | 新增 runs |
+|---|---|---|---|
+| Vim-T full (with MLP) + DyT | 1 | +2 | 2 |
+| Vim-T full (with MLP) + LN | 1 | +2 | 2 |
+| Vim-T -MLP + DyT | 1 | +2 | 2 |
+| Vim-T -MLP + LN | 1 | +2 | 2 |
+
+**新增 runs: 8**
+
+### E7: ConvNeXt-T Selective Replacement
+
+**优先级：P1**
+
+**目的：** 验证 hierarchical feature-scale controller role。ConvNeXt 用 post-depthwise LN (LN2d)，不是 pre-norm residual pattern，但 selective replacement 仍可测试 "保留 downsample norms" 的效果。
+
+**配置：**
+
+| Config | 目的 | Seeds |
+|---|---|---|
+| Full LN | Baseline | 已有 3 seeds |
+| Full DyT | Full replacement | 已有 3 seeds |
+| **DyT within-stage only, preserve downsample norms** | Hierarchical role test | **新, 3 seeds** |
+| **DyT shallow stages (stage 1-2) only** | Depth-dependent test | **新, 3 seeds** |
+| **RMSNorm** | Baseline | **E1 中已计** |
+
+**新增 runs: 6**
+
+### E8: Swin-T Selective Replacement
+
+**优先级：P1**
+
+**配置：**
+
+| Config | 目的 | Seeds |
+|---|---|---|
+| Full LN | Baseline | 已有 3 seeds |
+| Full DyT | Full replacement | 已有 3 seeds |
+| **Preserve patch-merging norms, DyT within-block** | Stage transition role test | **新, 3 seeds** |
+| **DyT shallow stages only** | Depth-dependent test | **新, 3 seeds** |
+| **RMSNorm** | Baseline | **E1 中已计** |
+
+**新增 runs: 6**
+
+注意：Swin-T 使用了非标准超参数（lr=5×10⁻⁴, 5-epoch warmup, gradient clipping=5.0），保持一致。
+
+### E9: CaiT Depth Threshold Ablation
+
+**优先级：P1**
+
+**目的：** 直接验证 depth-width factor。DeiT-T (12L/192) 成功 (+3.91) 而 CaiT-XXS24 (24+2L/192) 失败 (-12.34)。中间有没有阈值？
+
+**配置：** 对 CaiT-XXS24，只在前 k 层 SA blocks 应用 DyT，保留其余为 LN：
+
+| k (DyT layers) | 总 SA layers | 目的 | Seeds |
+|---|---|---|---|
+| 6 | 24 | 浅层 only | 1 |
+| 12 | 24 | 半数 | 1 |
+| 18 | 24 | 深层也替换 | 1 |
+| 24 (full SA) | 24 | 全替换（≈已有 SA-only ablation） | 已有 1 seed |
+
+**新增 runs: 3-4**（如果结果 pattern 清晰，不需多 seed）
+
+**预期结论：** k=12 或以下时 DyT 仍 positive → depth threshold 在 12-18 层之间。配合 DeiT-T (12L positive) 的数据点，画出连续的 depth vs. DyT Δ 曲线。
+
+### E10: PlainMamba-T +MLP 补 Seeds
+
+**优先级：P1**
+
+**新增 runs: 4**（+MLP DyT/LN × 2 extra seeds）
+
+### E11: Selective DyT CIFAR-100-C Evaluation
+
+**优先级：P1**
+
+**目的：** 验证 Pareto optimality——selective DyT 是否保留 DyT 的 corruption robustness gain。
+
+**方法：** 对 E2, E3, E7, E8 的 selective DyT checkpoints 跑 CIFAR-100-C 15 corruption types × severity 1-5。
+
+**零训练成本，仅需 evaluation 脚本。**
+
+**预期结论：** 如果 selective DyT 在 RWKV-T 上 clean ≈ LN 且 corruption > LN，这是论文最有说服力的正向结果。
+
+### E12: Tiny-ImageNet Selective + RMSNorm
+
+**优先级：P2**
+
+**配置：** DeiT-S, Vim-T, RWKV-T 的 LN / RMSNorm / Full DyT / Selective DyT × 3 seeds = ~36 runs
+
+**训练时间：** Tiny-ImageNet (64→32) ~2× CIFAR-100，总计 ~2 GPU-days
+
+### E13: Resolution Continuum Curve
+
+**优先级：P2**
+
+**目的：** 在 DeiT-S 上跑 64×64 和 128×128，连接 32×32 (+6.90) 和 224×224 (-18.3) 两个端点，画出连续的 resolution vs. DyT Δ 曲线。
+
+**配置：** DeiT-S, LN/DyT, 64×64 和 128×128, 1 seed each = 4 runs
+
+**配合 α-deadlock 的 αx₀ ∝ p² 分析，精确定位 breakpoint resolution。**
+
+### E14: 核心实验 5-Seed 扩展
+
+**优先级：P2**
+
+对 P0 实验中最关键的配置从 3 seeds 扩展到 5 seeds，支撑 paired t-test 统计检验：
+- RWKV-T selective DyT: +2 seeds = 2 runs
+- Vim-T selective DyT: +2 seeds = 2 runs
+- DeiT-S RMSNorm: +2 seeds = 2 runs
+- DeiT-S DyT α=0.5: +2 seeds = 2 runs
+- 对应 LN baselines: +2 seeds each where needed
+
+**新增 ~20-30 runs**
+
+---
+
+## 7. 零成本分析任务
+
+### A1: Per-Layer Learned α ↔ Role Taxonomy Correlation
+
+**优先级：P0**
+
+**目的：** 为 role taxonomy 提供非循环证据。如果不同 role 的 norm sites 学到不同的 α 分布，taxonomy 就有独立于 DyT 结果的验证。
+
+**方法：**
+1. 从已有 converged checkpoints 提取所有 norm sites 的 learned α（论文 Figure 5 已有 seed=42 数据）
+2. 按计算图位置分类（pre-attn / pre-FFN / state-adjacent / key\_norm）
+3. 跨架构做 α vs. position-type box plot
+4. 检验不同 role 的 α 分布是否有显著差异
+
+**预期结果：**
+- Activation stabilizer sites（pre-attn, pre-FFN）：低 α（near-linear regime）
+- State-dynamics sites：中等 α
+- Architectural invariant sites（key\_norm）：高 α（试图 enforce constraint）
+- 深层比浅层 α 更高（已有 Figure 5 支持）
+
+**成本：零新训练。Agent 几小时完成分析 + 图表。**
+
+### A2: Activation Distribution Comparison Figure
+
+**优先级：P0**
+
+**目的：** 最直观的 role taxonomy 可视化证据。
+
+**方法：** 从 converged checkpoints 提取不同 norm sites 的 pre-activation 和 post-normalization 分布，对比 LN vs. DyT。
+
+**设计 3 个 panel：**
+
+Panel 1: DeiT-S residual pre-attn norm
+- LN output distribution vs. DyT output distribution → 预期：非常相似
+
+Panel 2: RWKV-T key\_norm site
+- LN output distribution vs. DyT output distribution → 预期：明显不同（DyT 被 tanh 压缩到 [-1,1]，key magnitude 结构被破坏）
+
+Panel 3: ConvNeXt-T downsample norm site
+- LN output vs. DyT output → 预期：scale mismatch
+
+**成本：零新训练。Agent 几小时。**
+
+### A3: Depth-Width Scaling Formula
+
+**优先级：P1**
+
+**目的：** 拟合简单公式预测 DyT Δ，从 post-hoc 升级为 predictive。
+
+**数据点（open-loop architectures with pre-norm pattern）：**
+
+| Arch | L | d | L×(1/d) | Δ |
+|---|---|---|---|---|
+| DeiT-S | 12 | 384 | 0.031 | +6.90 |
+| DeiT-T | 12 | 192 | 0.063 | +3.91 |
+| CaiT-XXS24 | 26 | 192 | 0.135 | -12.34 |
+
+加上 E9 的 CaiT depth ablation 数据点，尝试拟合：
+```
+Δ_predicted ≈ a - b × (L/d)
 ```
 
-用 grouped bar 展示 recovery。
+**即使 R² 只有 0.7，能预测 Δ 符号就有价值。**
 
-### Figure 3：α stability landscape
+**配合 closed-loop 数据（Vim-T L=10/d=384 Δ=+3.45, PlainMamba-T L=12/d=384 Δ=-0.41），检验公式是否需要 topology 修正项。**
 
-x-axis：α  
-y-axis：accuracy 或 DyT-LN delta  
-颜色：模型  
-标记 collapse 区间。
+### A4: Early-α Diagnostic Validation
 
-### Figure 4：Mechanism diagnostics
+**优先级：P1**
 
-建议分三个 panel：
+**目的：** 从训练前 20 epochs 的 per-site α trajectory 预测最终 DyT 成功/失败。
 
-1. RWKV key norm distribution；
-2. Vim state norm across layers/tokens；
-3. DyT saturation ratio vs effective rank / accuracy。
+**方法：**
+1. 修改训练代码，每 epoch 记录所有 DyT sites 的 learned α 值
+2. 对已有实验（或 rerun 前 20 epochs）提取 α trajectory
+3. 定义 diagnostic metric: max α across sites at epoch 20, 或 α growth rate
+4. 检验：成功架构 (DeiT) 的 early-α 是否 < 阈值，失败架构 (CaiT, Swin) 的 early-α 是否 > 阈值
 
----
+**如果阈值存在，提出实用规则：**
+> Monitor per-site α after 20 epochs. If any site's α > τ, preserve that site as LN.
 
-## 9. 写作层面的具体修改
+**成本：** 需要修改代码记录 α trajectory（agent 几分钟），可能需要对部分实验 rerun 前 20 epochs（每 run ~5-15 min）。
 
-### 9.1 Abstract 修改方向
+### A5: Zhu et al. 2025 Recipe 对比
 
-不要堆太多数值。建议结构：
+**优先级：P1**
 
-1. DyT 背景；
-2. 现有 gap：是否跨架构通用未知；
-3. 本文 thesis：LayerNorm 的功能角色决定可替代性；
-4. 主要结果：DeiT 成功，SSM 脆弱，RWKV/hierarchical 失败；
-5. 方法：role-aware selective replacement；
-6. takeaway：不要 blanket replacement。
+**目的：** 审稿人 100% 会问为什么 Zhu et al. 在 ImageNet-1K 224×224 上 DeiT 报告 positive，本文 ImageNet-100 224×224 报告 -18 pp。
 
-### 9.2 Introduction 修改方向
+**方法：**
+1. 做一张 setup comparison table (Zhu et al. vs. ours)
+2. 如果 Zhu et al. 开源了代码/config，尝试用他们的 recipe 在 ImageNet-100 上复现
+3. 识别关键差异（pre-trained init? longer training? different α? per-channel γ,β?）
 
-Introduction 需要更清楚地区分：
+**可能的解释：**
+- Zhu et al. 使用了 pre-trained weights（DyT 在 fine-tune 时 ok，from scratch 时 fail）
+- Zhu et al. 训练 300 epochs vs. 本文 100 epochs（更长训练可能让 α 有时间逃离 deadlock）
+- Zhu et al. 可能使用了不同的 α initialization 或 per-channel scaling
 
-- module name：都叫 LayerNorm；
-- functional role：实际功能不同；
-- replacement risk：DyT 只替代 bounded activation rescaling，不能替代所有 norm 功能。
-
-建议 introduction 的核心段落：
-
-> A normalization module is not defined solely by its formula. In modern architectures, the same LayerNorm operator can stabilize residual activations, regulate recurrent state dynamics, enforce key/query magnitude constraints, or align feature scales across resolution stages. A pointwise bounded nonlinearity such as DyT can plausibly replace the first role, but not necessarily the others.
-
-### 9.3 Results 修改方向
-
-Results 不要按模型流水账写，而要按 role/failure mode 写：
-
-1. Activation stabilizer：DeiT success；
-2. State-dynamics stabilizer：Vim fragility；
-3. Architectural invariant：RWKV key_norm；
-4. Hierarchical feature-scale controller：ConvNeXt/Swin failure；
-5. α stability；
-6. role-aware replacement。
-
-### 9.4 Discussion 修改方向
-
-Discussion 要主动弱化 claim：
-
-不要写：
-
-> topology predicts DyT effectiveness.
-
-改成：
-
-> topology provides useful cues for identifying normalization roles, but the replacement outcome is determined by the functional role of each normalization site and its interaction with α, depth, width, and resolution.
-
-### 9.5 Limitations 修改方向
-
-Limitations 要诚实但不自毁：
-
-1. role taxonomy 是 empirical framework，不是 formal theory；
-2. selective replacement policy 仍需更多架构验证；
-3. high-resolution ImageNet-scale training 仍未充分覆盖；
-4. 部分 auxiliary probes 仍是 single-seed；
-5. α tuning 与 recipe sensitivity 说明 DyT 不是 plug-and-play。
-
-但要强调：
-
-> These limitations do not undermine the main conclusion that blanket LayerNorm-to-DyT replacement is unsafe; rather, they motivate the role-aware replacement principle.
+**成本：** 1-3 runs (如果尝试 recipe 复现) + 文献研究。
 
 ---
 
-## 10. 哪些建议不要短期做
+## 8. 5 天执行计划
 
-### 10.1 不建议短期做 ImageNet-1K 完整训练
+### Day 0: 代码改造 + 启动第一批实验
 
-原因：
+**Agent 并行任务（coding）：**
 
-- 2–4 张 5090，5 天内很难完成多模型、多 baseline、多 seed；
-- 即使跑出单 seed，也未必能说服审稿人；
-- 可能拖垮主线写作。
-
-长期可以作为 rebuttal / camera-ready / 后续版本。
-
-### 10.2 不建议短期做 COCO/ADE20K
-
-原因：
-
-- 接入和训练成本高；
-- 容易引入新的 recipe confound；
-- 与当前 DyT/LN 替换主线距离较远。
-
-### 10.3 不建议短期接大量新模型
-
-原因：
-
-- 当前已有 10 个模型，问题不是绝对模型数，而是证据组织和机制验证；
-- 新模型容易引入工程风险；
-- 5 天内最重要的是把现有结果变成 role-aware story。
-
-### 10.4 不建议短期做 fused DyT kernel
-
-原因：
-
-- 当前吞吐实验显示 DyT 不一定比 LN 快；
-- 效率不是这篇论文最稳的主线；
-- kernel 优化会转移注意力。
-
-### 10.5 不建议短期做 NLP/LM 扩展
-
-原因：
-
-- 会让论文从视觉架构分析扩散到另一个领域；
-- 需要新的数据、模型、训练 recipe；
-- 5 天内风险大于收益。
-
----
-
-## 11. 最小可接受完成标准
-
-如果时间非常紧，至少完成以下内容：
-
-1. **RWKV-T role-aware selective replacement 3 seeds**；
-2. **Vim-T α sensitivity 3 seeds**；
-3. **DeiT-S/T RMSNorm baseline 3 seeds**；
-4. **主文从 topology 改为 functional role narrative**；
-5. **α sensitivity 从附录移到主文**；
-6. **机制分析至少包含 RWKV key magnitude、Vim state norm、DyT saturation ratio**；
-7. **主表包含 LN / RMSNorm / Full DyT / Role-aware DyT**；
-8. **limitations 中主动承认 role taxonomy 是 empirical framework，不是 formal theory**。
-
-完成这些后，论文质量会明显高于当前版本。
-
----
-
-## 12. 理想完成标准
-
-如果 4 张 GPU 运行顺利，建议额外完成：
-
-1. ConvNeXt-T selective replacement 3 seeds；
-2. Swin-T selective replacement 1–3 seeds；
-3. Vim-T ±MLP 3 seeds；
-4. PlainMamba-T +MLP 3 seeds；
-5. ViT-Tiny 3 seeds；
-6. DeiT-S/T resolution diagnostic 1 seed；
-7. validation-selected checkpoint sanity check；
-8. final epoch accuracy 对照。
-
-这些会进一步提升 soundness 和 presentation。
-
----
-
-## 13. 预期提升效果
-
-吸纳该方案后，论文会从：
-
-> DyT 在不同 topology 上表现不同。
-
-提升为：
-
-> LayerNorm 的功能角色决定 DyT 是否可替代。Full replacement 会失败，而 role-aware selective replacement 更可靠。
-
-具体提升包括：
-
-| 维度 | 当前版本 | 吸纳后版本 |
+| Agent | 任务 | 产出 |
 |---|---|---|
-| 主线 | topology-dependent effectiveness | role-dependent compatibility |
-| 贡献 | 多架构经验观察 | normalization replacement failure-mode diagnosis |
-| 方法 | full DyT replacement | role-aware selective replacement |
-| 反例处理 | topology 叙事的例外 | functional role 边界证据 |
-| α tuning | 潜在漏洞 | 主结果之一：α-stability landscape |
-| RWKV key_norm | 局部 ablation | architectural invariant 的核心证据 |
-| 实践价值 | per-architecture validation | 判断哪些 norm 能换、哪些不能换 |
-| NeurIPS 风险 | overclaim topology | claim 更稳、evidence 更匹配 |
+| Agent-Code-1 | 实现 RMSNorm 替换 | RMSNorm class + config 开关 |
+| Agent-Code-2 | 实现 selective replacement（按 norm site name/position 指定 preserve list） | 每个架构的 preserve config |
+| Agent-Code-3 | 实现 DyT-v2 variants（DyT-Res, DyT-Clamp, DyT-Warmup） | 3 个新 DyT class |
+| Agent-Code-4 | 实现 per-epoch α logging + CIFAR-100-C evaluation pipeline | α trajectory logger + corruption eval script |
+
+**Day 0 晚间启动 GPU（代码完成后立即开始）：**
+
+| GPU | 实验 | Runs | 预计时间 |
+|---|---|---|---|
+| GPU 1 | E1: RMSNorm - DeiT-S(3), DeiT-T(3), RWKV-T(3) | 9 | ~5h |
+| GPU 2 | E1: RMSNorm - Vim-T(3), PlainMamba-T(3) | 6 | ~6h |
+| GPU 3 | E1: RMSNorm - ConvNeXt-T(3), Swin-T(3) | 6 | ~8h |
+| GPU 4 | E5: DyT-v2 on ImageNet-100 224×224 (4-6 configs × 1 seed) | 4-6 | ~8-16h |
+
+### Day 1: 核心 Selective Replacement 实验
+
+**GPU 任务：**
+
+| GPU | 实验 | Runs | 预计时间 |
+|---|---|---|---|
+| GPU 1 | E2: RWKV-T selective (2 configs × 3 seeds) + α=1.0 补 2 seeds | 8 | ~4h |
+| GPU 2 | E3: Vim-T selective (2 configs × 3 seeds) + α补seeds | 10-13 | ~12h |
+| GPU 3 | E4: DeiT-S/T α补seeds (10 runs) | 10 | ~6h, 然后 E6: Vim ±MLP (8 runs) ~8h |
+| GPU 4 | E9: CaiT depth threshold (3-4 runs) + E10: PlainMamba +MLP (4 runs) | 7-8 | ~6h, 然后 E7: ConvNeXt selective (6 runs) ~8h |
+
+**Agent 并行任务（分析）：**
+
+| Agent | 任务 | 产出 |
+|---|---|---|
+| Agent-Analysis-1 | A1: Per-layer α ↔ role correlation（从现有 checkpoints） | α vs. role-type box plot |
+| Agent-Analysis-2 | A2: Activation distribution comparison（从现有 checkpoints） | 3-panel distribution figure |
+| Agent-Analysis-3 | A5: Zhu et al. recipe 对比研究 | Setup comparison table |
+| Agent-Writing-1 | 草拟 role taxonomy section + Algorithm 1 | LaTeX draft |
+
+### Day 2: 补充实验 + 大规模分析
+
+**GPU 任务：**
+
+| GPU | 实验 | 预计时间 |
+|---|---|---|
+| GPU 1 | E8: Swin-T selective (6 runs) | ~8h |
+| GPU 2 | E14: 核心 5-seed 扩展 (10-15 runs) | ~12h |
+| GPU 3 | E12: Tiny-ImageNet selective + RMSNorm (18-27 runs，优先 DeiT-S + RWKV-T) | ~全天 |
+| GPU 4 | E13: Resolution continuum (4 runs) + 重跑失败实验 | ~8h |
+
+**Agent 并行任务：**
+
+| Agent | 任务 | 产出 |
+|---|---|---|
+| Agent-Analysis-1 | E11: CIFAR-100-C eval 对所有 selective DyT checkpoints | Corruption accuracy tables |
+| Agent-Analysis-2 | 构建 Pareto 曲线（clean vs. corruption，每个点是一种 config） | Pareto figure |
+| Agent-Analysis-3 | A3: Depth-width scaling formula 拟合 | Regression plot |
+| Agent-Analysis-4 | A4: Early-α diagnostic（从 Day 1 的 α logs 提取） | α trajectory plot + diagnostic rule |
+| Agent-Analysis-5 | E5 结果分析：DyT-v2 在 224×224 效果评估 | DyT-v2 analysis |
+| Agent-Writing-1 | 重写 Introduction + Method | LaTeX draft |
+| Agent-Writing-2 | 重写 Results: cross-architecture outcomes | LaTeX draft |
+
+### Day 3: 论文重写日
+
+**所有实验应已完成。** GPU 用于重跑失败实验和 P2 补充。
+
+**Agent 并行任务：**
+
+| Agent | 任务 | 产出 |
+|---|---|---|
+| Agent-Writing-1 | 重写 Abstract | LaTeX |
+| Agent-Writing-2 | 重写 Results: role-aware selective replacement + Pareto analysis | LaTeX |
+| Agent-Writing-3 | 重写 Results: α-stability + α-deadlock mechanism (从 Appendix K 移入) | LaTeX |
+| Agent-Writing-4 | 重写 Results: corruption robustness as implicit regularization | LaTeX |
+| Agent-Writing-5 | 重写 Discussion + Limitations | LaTeX |
+| Agent-Writing-6 | 整理所有新 figures + tables | LaTeX |
+| Agent-Analysis-1 | Claim-evidence audit: 逐条检查 claim 是否有 ≥3 seeds 支持 | Audit report |
+
+### Day 4: 压力测试 + 最终打磨
+
+**Agent 并行任务：**
+
+| Agent | 任务 |
+|---|---|
+| Agent-Review-1 | 模拟 NeurIPS Reviewer 1 (novelty focus): "Where's the new method?" |
+| Agent-Review-2 | 模拟 NeurIPS Reviewer 2 (soundness focus): "Post-hoc? Single-seed? Scale?" |
+| Agent-Review-3 | 模拟 NeurIPS Reviewer 3 (significance focus): "Who benefits? Practical impact?" |
+| Agent-Fix-1 | 根据 review 修改论文中的弱点 |
+| Agent-Fix-2 | 最终数字校对（表格数字与实验 log 一致性） |
+| Agent-Fix-3 | References 检查 + NeurIPS checklist 更新 |
+| Agent-Fix-4 | 重写 Conclusion，确保 claim 与 evidence 精确匹配 |
+
+**Reviewer Attack List + 准备好的回应：**
+
+| 攻击 | 准备的回应 |
+|---|---|
+| "Role taxonomy is post-hoc" | Per-layer α correlation (A1) + activation distribution (A2) 提供非循环证据；taxonomy 基于计算图位置，不依赖 DyT 结果 |
+| "Selective replacement is too simple" | Algorithm 1 正式化 + Pareto optimality 展示它不只是简单保留，而是 optimal trade-off |
+| "32×32 scale is too small" | α-deadlock mechanism 提供 resolution-dependent 解释；DyT-v2 探索 fix；32×32 是 controlled testbed (precedent: ViT paper) |
+| "Where's RMSNorm?" | 全架构 RMSNorm baseline + 按 role 分组分析 |
+| "How is this different from Zhu et al.?" | 显式 recipe comparison + cross-topology extension + role-aware method |
+| "α tuning resolves all failures?" | α-sensitivity heatmap (Figure 8) 显示 Swin/CaiT 在所有 α 下仍 ≥6.6 pp below LN |
+| "Single-seed ablations?" | Key ablations 补到 3-5 seeds + paired statistical tests |
+| "Corruption robustness is just a side effect?" | All 4 architectures improve; RWKV-T improves corruption DESPITE clean accuracy drop; selective DyT preserves this gain |
 
 ---
 
-## 14. 最终结论
+## 9. 论文结构设计
 
-这份提升方案的核心不是“多跑实验”，而是重新组织论文的科学问题：
+### 主文结构
 
-> 从“DyT 在哪些 topology 上有效”转向“DyT 能替代 LayerNorm 的哪些功能角色”。
+```
+1. Introduction
+   - DyT 背景 + "normalization is not one thing" 洞察
+   - 核心发现预览：role-aware selective > full LN > full DyT (on Pareto frontier)
+   - Contribution list (5 点)
 
-这个转变能显著提升论文质量，因为：
+2. Related Work
+   - Normalization in deep learning
+   - Normalization-free networks (Fixup, ReZero, NFNet, DyT, Chen et al.)
+   - Architecture-dependent normalization
 
-1. 它避免 topology 过强 claim 被反例打穿；
-2. 它把 CaiT、Swin、ConvNeXt、RWKV 等负结果变成支持边界的证据；
-3. 它让 RWKV key_norm ablation 成为核心贡献；
-4. 它自然引出 role-aware selective replacement 这个正向方法；
-5. 它把 α sensitivity 从漏洞变成稳定性 landscape；
-6. 它给实践者明确建议：不要按模块名替换 LayerNorm，而要按功能角色替换。
+3. Method
+   3.1 Architecture Taxonomy (保留 topology 作为 organizing lens)
+   3.2 Normalization Functional Role Taxonomy (4 类，基于计算图位置)
+   3.3 DyT Replacement Protocol (universal + selective)
+   3.4 Algorithm 1: Role-Aware Replacement Protocol
 
-最终建议提交版本的主张应当保持克制：
+4. Experimental Setup
+   - Datasets, training recipe, evaluation protocol
+   - RMSNorm baseline description
 
-> Within the tested vision architectures and low-resolution settings, DyT is effective when replacing activation-stabilizing normalization sites, but becomes fragile or harmful for state-critical, invariant-enforcing, or hierarchical scale-controlling normalization sites. Therefore, DyT should be applied as a role-aware selective replacement rather than a blanket LayerNorm substitute.
+5. Results
+   5.1 Cross-Architecture DyT Effectiveness (Table 1 + Figure 1)
+       - 按 role 组织，不按 model 流水账
+   5.2 Role-Aware Selective Replacement (Table 2 + Pareto figure)
+       - Selective DyT Pareto optimality: clean ≈ LN + corruption > LN
+   5.3 RMSNorm as Control Experiment
+       - RMSNorm 是否也显示 role-dependent pattern
+   5.4 Corruption Robustness as Implicit Regularization (Table 3)
+       - DyT universally improves corruption robustness
+   5.5 α-Stability Landscape (Figure + heatmap)
+       - Topology-dependent stability windows
+       - Early-α diagnostic
 
-这会比当前版本更稳、更深，也更像 NeurIPS Main Track 的 empirical diagnosis paper。
+6. Discussion
+   6.1 α-Deadlock Mechanism and Resolution Boundary
+       - 数学推导 (Eq. 2-3)
+       - Causal chain (Figure)
+       - Resolution-dependent capacity ceiling
+       - DyT-v2 exploration results
+   6.2 Depth-Width Interaction
+       - Scaling formula
+       - CaiT depth threshold
+   6.3 Compensatory Pathways: MLP Channel
+   6.4 Validation of Role Taxonomy
+       - Per-layer α correlation
+       - Activation distribution comparison
+
+7. Limitations
+
+8. Conclusion
+```
+
+### 主文 Figure/Table 设计
+
+**Table 1: Cross-Architecture Results**
+
+| Architecture | Topology | Role | LN | RMSNorm | Full DyT | Selective DyT | Δ Full | Δ Selective |
+|---|---|---|---|---|---|---|---|---|
+| DeiT-S | Open-loop | Act. stab. | 58.0 | ? | 64.9 | 64.9* | +6.90 | +6.90* |
+| DeiT-T | Open-loop | Act. stab. | 56.9 | ? | 60.8 | — | +3.91 | — |
+| Vim-T | Closed-loop | State-dyn. | 61.1 | ? | 64.5 | ? | +3.45 | ? |
+| PlainMamba-T | Closed-loop | State-dyn. | 74.2 | ? | 73.8 | — | -0.41 | — |
+| RWKV-T | Hybrid | Arch. inv. | 74.6 | ? | 72.5 | ? | -2.17 | ? |
+| ConvNeXt-T | Open (CNN) | Hier. scale | 55.1 | ? | 43.0 | ? | -12.11 | ? |
+| Swin-T | Open (win.) | Hier. scale | 64.0 | ? | 46.8 | ? | -17.18 | ? |
+
+*DeiT-S 全部 norm 都是 activation stabilizer，所以 selective = full DyT
+
+**Figure 1: Pareto Analysis (Hero Figure)**
+
+x-axis: Clean accuracy
+y-axis: Mean corruption accuracy
+每个点 = (architecture, normalization config)
+颜色 = architecture
+形状 = config (LN=circle, RMSNorm=diamond, Full DyT=cross, Selective DyT=star)
+
+**如果 selective DyT 的 star 点在 LN circle 和 Full DyT cross 的右上方（clean ≈ LN, corruption > LN），这张图一张就能讲完整个 story。**
+
+**Figure 2: Role Taxonomy + Decision Flowchart**
+
+左半：4 类 role 的示意图（标注在不同架构的计算图上）
+右半：Algorithm 1 的 decision flowchart
+
+**Figure 3: α-Stability Heatmap**
+
+已有 Figure 8 数据，加入 selective DyT 的 stability window 对比。
+
+**Figure 4: α-Deadlock Mechanism**
+
+已有 Figure 7 的 causal chain，加入 DyT-v2 的 resolution curve（如果做了 E13）。
+
+**Figure 5: Mechanistic Evidence for Role Taxonomy**
+
+3 panel: (a) per-layer α vs. role-type, (b) activation distribution comparison, (c) effective rank
+
+### Algorithm 1: Role-Aware DyT Replacement
+
+```
+Algorithm 1: Role-Aware Normalization Replacement
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Input: Model M with LayerNorm sites {s₁, ..., sₙ}
+Output: Model M' with selective DyT replacement
+
+1. For each norm site sᵢ, classify by computational graph position:
+   - Residual pre-attention / pre-FFN → ACTIVATION_STABILIZER
+   - SSM state path / recurrent update input → STATE_DYNAMICS
+   - Key/Query/specialized functional norm → ARCHITECTURAL_INVARIANT
+   - Downsample / stage transition / patch merging → HIERARCHICAL_CONTROLLER
+
+2. Replace ACTIVATION_STABILIZER sites with DyT(α_init = 0.5)
+
+3. Preserve ARCHITECTURAL_INVARIANT and HIERARCHICAL_CONTROLLER as LayerNorm
+
+4. For STATE_DYNAMICS sites:
+   a. Replace with DyT(α_init = 0.25)
+   b. Train for 20 epochs, monitor per-site learned α
+   c. If max(α) > τ or val_accuracy < baseline − ε: revert to LayerNorm
+
+5. Return M'
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## 10. 写作层面的具体修改
+
+### 10.1 Abstract 结构
+
+```
+1. Background: DyT replaces LN with learnable bounded nonlinearity
+2. Gap: Whether DyT transfers beyond standard self-attention is unknown
+3. Key insight: Same LayerNorm formula serves different functional roles
+4. Core finding: Role-aware selective replacement achieves Pareto optimality
+   (clean ≈ LN + corruption > LN)
+5. Mechanistic contribution: α-deadlock at high resolution
+6. Practical contribution: Early-α diagnostic for safe deployment
+```
+
+不堆数字。只在最关键处给 1-2 个数字（e.g., "selective DyT matches LN clean accuracy while improving corruption robustness by +X pp across Y architectures"）。
+
+### 10.2 Introduction 核心段落
+
+> A normalization module is not defined solely by its formula. In modern vision architectures, the same `nn.LayerNorm` call can stabilize residual activations (DeiT), regulate recurrent state dynamics (Vim), enforce key-magnitude invariants (RWKV), or align feature scales across resolution stages (Swin, ConvNeXt). A pointwise bounded nonlinearity like DyT can substitute the first role but not the others. This observation motivates **role-aware selective replacement**: applying DyT only where normalization serves as an activation stabilizer, and preserving LayerNorm at architecture-critical sites.
+
+> Surprisingly, this selective strategy is not merely a compromise — it achieves **Pareto-optimal** performance: matching full LayerNorm on clean accuracy while surpassing it on corruption robustness. The bounded activation range of DyT at appropriate sites provides implicit distribution-shift regularization without disrupting architecture-critical normalization functions.
+
+### 10.3 Results 组织原则
+
+**按 role 和 finding 组织，不按 model 流水账：**
+
+1. **Cross-architecture landscape** —— 10 architectures, 3 outcome groups, role explains all
+2. **Selective replacement as Pareto optimum** —— The positive headline result
+3. **RMSNorm control** —— Is role-dependency DyT-specific or general?
+4. **Corruption robustness** —— The surprising finding
+5. **α-stability** —— Topology-dependent stability windows + early-α diagnostic
+
+### 10.4 Discussion 要点
+
+不要写 "topology predicts DyT effectiveness"。改成：
+
+> Topology provides a useful organizing lens for understanding normalization diversity, but the replacement outcome is determined by the functional role of each normalization site and its interaction with depth, width, α, and resolution. The role taxonomy — defined by computational graph position — offers a principled basis for selective replacement decisions.
+
+### 10.5 Limitations（诚实但不自毁）
+
+1. Role taxonomy is an empirical framework, not a formal theory
+2. Selective replacement protocol tested on 4 architectures with selective configs; generalization to untested architectures requires the early-α diagnostic
+3. Primary experiments at 32×32; the α-deadlock analysis provides resolution-dependent mechanistic explanation rather than large-scale empirical validation
+4. Statistical power limited by 3-5 seeds; we report paired effect sizes and note where results are marginal
+5. DyT-v2 exploration is preliminary; a complete solution to the resolution boundary remains open
+
+但强调：
+
+> These limitations do not undermine the core finding: blanket LayerNorm-to-DyT replacement is unsafe, while role-aware selective replacement consistently achieves a better clean-robustness trade-off than either extreme.
+
+---
+
+## 11. 完成标准
+
+### 最小可接受标准（P0 全部完成）
+
+1. RMSNorm baseline 7 架构 × 3 seeds
+2. RWKV-T selective replacement 2 configs × 3 seeds + CIFAR-100-C eval
+3. Vim-T selective replacement 2 configs × 3 seeds
+4. DeiT-S/T α 补 seeds
+5. DyT-v2 at 224×224 至少 3 variants × 1 seed
+6. Per-layer α ↔ role correlation 分析
+7. Activation distribution comparison figure
+8. Algorithm 1 box + decision flowchart
+9. α-deadlock 从 Appendix K 移入主文 Discussion
+10. Corruption robustness 从 Appendix C 移入主文 Results
+11. 主文重写完成（role-aware narrative + Pareto framing）
+12. Pareto 曲线 (clean vs. corruption) 作为 hero figure
+
+**预估中稿概率：35-42%**
+
+### 理想完成标准（P0+P1 全部完成）
+
+在最小标准基础上，额外：
+
+1. ConvNeXt-T selective replacement 3 seeds
+2. Swin-T selective replacement 3 seeds
+3. CaiT depth threshold ablation
+4. Vim ±MLP 补到 3 seeds
+5. PlainMamba-T +MLP 补到 3 seeds
+6. Depth-width scaling formula
+7. Early-α diagnostic validation + 阈值 τ 确定
+8. Zhu et al. recipe 对比
+9. CIFAR-100-C eval 覆盖所有 selective DyT configs
+10. 统计检验（paired t-test / Wilcoxon on 5-seed data）
+11. 模拟 3 reviewer 压力测试并修复
+
+**预估中稿概率：38-45%，如果 DyT-v2 在 224×224 有改善则 42-50%**
+
+### 全面完成标准（P0+P1+P2）
+
+额外：
+
+1. Tiny-ImageNet selective + RMSNorm 跨数据集验证
+2. Resolution continuum curve (32, 64, 128, 224)
+3. 核心实验 5-seed 扩展
+4. ViT-B/ViT-Tiny 额外架构验证
+
+**预估中稿概率：40-48%，如果 DyT-v2 work 则 45-52%**
+
+---
+
+## 12. 关键风险和 Contingency
+
+### 风险 1：Selective DyT 的 corruption robustness 不显著
+
+如果 selective DyT 在 RWKV-T 上 corruption ≈ LN（没有 gain），Pareto 论点弱化。
+
+**Contingency：** 改为强调 "selective DyT recovers clean accuracy while maintaining full DyT's corruption benefit partially"——仍然比 full DyT 好。
+
+### 风险 2：RMSNorm 在所有架构上都接近 LN
+
+如果 RMSNorm 完全 role-independent（所有架构都 ≈ LN），说明 mean-centering 不重要，但 role taxonomy 失去 generality（只对 DyT 有效）。
+
+**Contingency：** 改为 "the role-dependent failure is specific to bounded pointwise alternatives; statistical normalization (LN, RMSNorm) is uniformly robust because it preserves distributional information." 这仍然是有价值的 finding。
+
+### 风险 3：DyT-v2 全部失败
+
+**Contingency：** 放 appendix 作为 negative result，强调 "the bounded output range is a fundamental constraint; unbounded alternatives (RMSNorm) work because they preserve scale information." 这强化了 role taxonomy 的解释力。
+
+### 风险 4：Per-layer α 与 role 不相关
+
+如果不同 role sites 的 learned α 没有显著差异。
+
+**Contingency：** 不放这个分析。Role taxonomy 仍然由 selective replacement intervention 结果支撑（这是更强的因果证据）。
+
+### 风险 5：ConvNeXt/Swin selective replacement 无效
+
+ConvNeXt 的 LN2d (post-depthwise) 不是 pre-norm pattern，selective 可能不产生有意义的结果。
+
+**Contingency：** 如果失败，强调 "ConvNeXt's normalization serves a qualitatively different role (post-depthwise scale management) that is structurally incompatible with pointwise replacement at any site." 这仍然支持 role taxonomy。
+
+---
+
+## 13. 不做清单
+
+以下明确不在 5 天范围内：
+
+| 不做 | 原因 |
+|---|---|
+| ImageNet-1K 完整训练 | 2-4 卡 5 天内无法完成多模型多 seed |
+| COCO / ADE20K downstream | 成本高、recipe confound 大 |
+| 10-20 个新模型 | 当前 10 个模型足够，问题是证据组织 |
+| NLP / LM 扩展 | 不同领域、不同 recipe、5 天风险太大 |
+| Fused DyT CUDA kernel | 效率不是主线 |
+| 10-seed 全矩阵 | 5 seeds 足够支撑统计检验 |
+| Neural collapse 分析 | 有趣但与 role taxonomy 主线距离较远 |
+| Adversarial robustness | Corruption robustness 已经足够支撑正则化发现 |
+
+---
+
+## 14. 预期 Story Arc（最终版本）
+
+**Opening hook：**
+> Dynamic Tanh has been proposed as a normalization-free alternative to LayerNorm, but we find that blindly replacing all LayerNorm sites degrades or collapses most architectures. The key insight is that "LayerNorm" is not one thing — the same operator serves four distinct functional roles across modern vision architectures.
+
+**Core method：**
+> We propose role-aware selective replacement (Algorithm 1): replace activation-stabilizer norms with DyT, preserve architecture-critical norms as LayerNorm. This is not a compromise but a Pareto-optimal strategy — matching full LN on clean accuracy while surpassing it on corruption robustness.
+
+**Surprising finding：**
+> DyT universally improves corruption robustness across all tested architectures, even where it hurts clean accuracy. Role-aware selective replacement preserves this regularization benefit while recovering clean accuracy.
+
+**Mechanistic depth：**
+> We identify a resolution-dependent failure mode: at 224×224, tanh saturation creates a self-reinforcing α-deadlock, establishing a fundamental capacity boundary for pointwise normalization alternatives.
+
+**Practical tool：**
+> We provide a simple early-α diagnostic: monitoring per-site α growth during the first 20 training epochs predicts whether DyT replacement will succeed, enabling safe deployment without exhaustive architecture-specific validation.
+
+---
+
+## 15. 总结
+
+本方案的核心不是"多跑实验"，而是 **三重升级**：
+
+1. **从 diagnostic 到 prescriptive** —— Selective DyT 不是止损而是 Pareto 最优
+2. **从 phenomenon 到 mechanism** —— α-deadlock 数学分析 + role taxonomy 非循环验证
+3. **从 observation 到 tool** —— Algorithm 1 + early-α diagnostic 可供实践者直接使用
+
+**GPU 利用率：** P0+P1+P2 ≈ 160-225 runs / 350-450 capacity ≈ 45-65%。剩余留作失败重跑。
+
+**Agent 利用率：** Day 0-1 以 coding + 实验启动为主，Day 2-4 以分析 + 写作为主，每天 4-6 agents 并行。
+
+**预估 NeurIPS 中稿概率提升：从 15-20% → 35-50%**（取决于 Pareto 结果和 DyT-v2 结果）。
