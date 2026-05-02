@@ -1,5 +1,7 @@
 # NeurIPS 2026 论文五天提升方案：Agent Auto Research 场景下的 Message Pruning 强化计划
 
+> **版本说明**：本方案基于 comm_gate_mas_NeurIPS2026_v4_20260430.pdf 制定。latest_draft.pdf 经验证与 v4 文本内容完全一致（仅编译时间不同：v4 为 4/30 20:26，latest 为 5/1 01:19），因此本方案同时适用于两个版本。
+
 ## 0. 总目标
 
 当前论文的核心发现是：在 two-agent LLM solver-checker 系统中，acknowledgment 消息虽然在单条删除时最 disruptive，但在整体剪枝时可以安全删除，并能减少大量 LLM inference calls。
@@ -12,13 +14,35 @@
 
 > LLM agent communication 中存在一种通用的分析误区：局部扰动敏感性会高估某些结构性冗余消息的全局必要性。本文提出 functional message analysis protocol，并在 controlled reasoning system 与真实 Auto Research agent workflow 中验证该现象、机制和实际成本收益。
 
+### 执行前提：Agent Auto Research 高速执行
+
+本方案假定使用 Agent Auto Research 执行，coding 和写作速度远超人工。因此：
+
+- **真正的瓶颈是 GPU 推理时间**，不是人力编码或写作；
+- 五天内完成理想版本（全部实验 + 论文重写）完全可行；
+- Day 0-1 的 benchmark 搭建、代码实现、论文重写等工作可以在数小时内完成；
+- 并行 GPU 实验是关键优化点：多个实验可以在不同时段排队执行。
+
+### 时间瓶颈分析
+
+| 任务 | Agent 耗时 | GPU 耗时 (4×RTX 5090) |
+|---|---|---|
+| 构造 100 个 research questions | 数小时 | 无 |
+| 搭建 3-agent workflow 代码 | 数小时 | 无 |
+| 100 tasks × 3 conditions (Qwen 7B) | 无 | ~8–12h |
+| Ack injection 500 positions × 3 conditions | 无 | ~6–10h |
+| Matched controls 500 tasks × 4 conditions | 无 | ~8–12h |
+| Learned detector 训练 + online validation | 30min | ~4–6h |
+| Judge 评价 (API) | 无 | ~2–4h |
+| 论文重写 (abstract, intro, 新 sections) | 数小时 | 无 |
+
 预期提升方向：
 
 - **Quality**：通过因果干预和 matched control 补强机制证据。
 - **Significance**：通过 Auto Research agent workflow 证明不是 toy benchmark 现象。
 - **Practicality**：通过 wall-clock latency / GPU cost profiling 证明不是只省 call count。
 - **Robustness**：通过 learned detector 的跨域 online validation 减少 oracle / heuristic 依赖。
-- **Clarity**：通过重构叙事，让论文从 “ack pruning trick” 变成 “agent communication analysis principle”。
+- **Clarity**：通过重构叙事，让论文从 "ack pruning trick" 变成 "agent communication analysis principle"。
 
 ---
 
@@ -26,7 +50,9 @@
 
 ### 1.1 任务场景偏 toy
 
-当前主结果主要来自 GSM8K、StrategyQA、ARC 等标准 reasoning benchmarks。虽然实验量不少，但 reviewer 很可能认为它仍然是一个 two-agent solver-checker toy phenomenon，而不是对真实 agent 系统有普遍意义的发现。
+当前主结果主要来自 GSM8K、StrategyQA、ARC 等标准 reasoning benchmarks。虽然实验量不少（15 个 configurations、3 backbones、3 topologies、7B/14B/72B），但 reviewer 很可能认为它仍然是一个 two-agent solver-checker toy phenomenon，而不是对真实 agent 系统有普遍意义的发现。
+
+> **注意**：论文的实验广度（backbone × domain × topology × scale）已经较强，reviewer 的核心担忧不是实验量不够，而是**任务类型单一**——全部是 QA reasoning，缺少更真实的 agent workflow。
 
 需要补：
 
@@ -37,27 +63,27 @@
 
 ### 1.2 核心机制仍偏相关性
 
-论文提出 cascade dissolution：acknowledgment 会形成自强化 cascade，整体剪枝会让这些 cascade 消失而非累积错误。
+论文提出 cascade dissolution：acknowledgment 会形成自强化 cascade，整体剪枝会让这些 cascade 消失而非累积错误。论文 Discussion 第 6 节自己承认 "cascade dissolution is a descriptive framework for the observed correlational patterns, not a confirmed causal mechanism"，并明确写道 "causal verification through controlled intervention remains needed"。
 
-但目前证据主要是：
+目前证据主要是：
 
-- P(ack | previous ack) 较高；
-- position-controlled logistic regression 显示 previous ack 提高后续 ack 概率；
+- P(ack | previous ack) 较高（Qwen 90.7%, Llama 61.9%，均 p < 10⁻¹³）；
+- position-controlled logistic regression 显示 previous ack 提高后续 ack 概率（Qwen OR=6.43, Llama OR=2.02）；
 - dose-response curve 较平；
-- ack 信息量低。
+- ack 信息量低（Qwen bigram novelty 5.7%）。
 
 这些是相关性证据，不是严格因果证明。
 
 需要补：
 
-- ack injection；
-- ack chain breaking；
-- position-matched non-ack pruning；
-- length-matched non-ack pruning。
+- **ack injection（正向因果）**：在 non-ack 位置插入 ack，观察是否引发后续 ack cascade；
+- **ack chain breaking（反向因果）**：在自然 ack 位置替换为 non-ack content，观察是否打断 cascade；
+- **position-matched non-ack pruning**：排除位置 confound；
+- **length-matched non-ack pruning**：排除长度 confound。
 
 ### 1.3 实际效率收益不够清楚
 
-当前论文强调减少的是 inference calls，而不是 token-level compression。但 reviewer 会问：
+当前论文强调减少的是 inference calls，而不是 token-level compression。论文自己承认 "message-level suppression (36–56%) translates to lower token-level savings (~10% Qwen, ~28% Llama) because acknowledgments are shorter than substantive messages"。但 reviewer 会问：
 
 - 真实 wall-clock latency 降了多少？
 - GPU seconds 降了多少？
@@ -76,7 +102,7 @@
 
 ### 1.4 5-class taxonomy 的完整贡献不够稳
 
-当前最强证据其实是 ack vs non-ack。Fine-grained 5-class taxonomy 中部分标签一致性较弱，尤其是 information_provision 这类边界模糊的标签。
+当前最强证据其实是 ack vs non-ack（Cohen's κ=0.721，binary ack/non-ack κ=0.81）。Fine-grained 5-class taxonomy 中部分标签一致性较弱，尤其是 information_provision（κ=0.237）。
 
 建议写作上收敛：
 
@@ -86,13 +112,23 @@
 
 ### 1.5 Detector 的 deployment claim 偏强
 
-当前 oracle 结果较强，heuristic 有一些结果，但 heuristic non-transferability 明显；DistilBERT online validation 只在单个 configuration 上做了。
+当前 oracle 结果较强，heuristic 有一些结果，但 heuristic non-transferability 明显（F1: 0.845 → 0.213 跨域）；DistilBERT online validation 只在单个 configuration 上做了（Qwen/GSM8K, N=300, seed 42, Δ=+0.7pp）。论文自己承认 "generalization across datasets, backbones, and random seeds remains unverified"。
 
 需要补：
 
 - TF-IDF + Logistic Regression online validation；
 - DistilBERT / TF-IDF 在 Auto Research、StrategyQA、Llama 上的小规模验证；
 - leave-one-domain / leave-one-backbone generalization。
+
+### 1.6 Llama heuristic over-suppression 的未解释发现
+
+论文 Appendix S.12 揭示一个重要问题：Llama online heuristic 的 suppression rate 是 74.8%，但只有 32.9% 是真正的 acknowledgment，54% 包含数学内容。然而 over-suppression 没有造成准确率下降（甚至 +8pp）。
+
+这说明 Llama 的很多非 ack 消息也是 redundant。这个发现目前论文只做了简单解释（"removal of redundant later-round messages"），但可以：
+
+- 作为 secondary finding 深入分析；
+- 为 ACK+FLOW 扩展提供 Llama 侧的佐证；
+- 如果在 Auto Research 实验中也观察到类似现象，可以统一叙述。
 
 ---
 
@@ -107,6 +143,8 @@
 ### 2.2 推荐叙事
 
 > We identify a general failure mode in LLM agent communication analysis: local perturbation sensitivity can overestimate the global necessity of structurally redundant messages. Acknowledgment messages are the canonical case. We show that they are locally disruptive but globally prunable in controlled solver-checker systems and in a realistic Auto Research agent workflow. We further provide causal interventions, matched controls, measured efficiency gains, and practical learned detectors.
+
+> **注意**：叙事升级的幅度必须和新增证据量匹配。如果因果实验结果弱或 Auto Research 实验中 ack rate 过低，则叙事应相应降级，避免 overclaim。
 
 ### 2.3 新 contribution 写法
 
@@ -128,40 +166,233 @@
 
 ## 3. 五天内最重要的新增实验
 
-优先级从高到低：
+### 优先级排序（已根据 ROI 和对 reviewer 说服力重新排序）
 
-1. **Auto Research 3-agent workflow**
-2. **真实 latency / GPU cost profiling**
-3. **Ack injection causal intervention**
-4. **Position / length-matched non-ack control**
-5. **Learned detector 跨域 online validation**
-6. **小规模 4-agent topology probe**
+| 优先级 | 实验 | 核心价值 |
+|---|---|---|
+| **P0** | Ack injection 因果干预 + chain breaking | 直接回应论文最大弱点——机制证据仅为相关性 |
+| **P0** | Auto Research 3-agent workflow（含 cost profiling） | 扩展应用场景，同时解决 toy benchmark 和效率收益两个短板 |
+| **P1** | Position / length-matched non-ack control | 排除 confound，提升 quality 评分 |
+| **P1** | 论文重写（abstract, intro, contributions, 新 sections） | 叙事升级 |
+| **P2** | Learned detector 跨域 online validation | 补充 deployment story |
+| ~~P3~~ | ~~4-agent topology probe~~ | **不建议做**：30 tasks 统计检验力太弱，3-agent 已足够 |
+
+> **变更说明**：原方案将 Auto Research 排在第一、Ack injection 排在第三。重新评估后，**Ack injection 因果干预提升到 P0**，因为它直接回应论文自己承认的最大弱点（"causal verification remains needed"），且 ROI 最高——可以在已有 GSM8K traces 上做，不需要新 benchmark。4-agent probe 从原方案中移除，因为 30 tasks 的规模下统计检验力不足以支撑任何有意义的结论。
 
 ---
 
-# 4. 实验一：Auto Research Agent Workflow
+# 4. 实验一：Ack Injection 因果干预 + Chain Breaking
 
 ## 4.1 目的
 
-证明该现象不是 GSM8K / StrategyQA 这种标准 QA benchmark 中的 toy phenomenon，而是出现在更真实的 LLM agent workflow 中。
+当前 cascade dissolution 主要是相关性证据。Ack injection + chain breaking 是五天内最强、最简单的因果实验，直接回应论文 Discussion 第 6 节自己提出的 "causal verification through controlled intervention remains needed"。
 
-核心 reviewer concern：
+核心问题：
 
-> This is interesting, but does it matter for real agent systems?
+> Does inserting an acknowledgment causally increase the probability of future acknowledgments? Does replacing a natural acknowledgment with content causally break the cascade?
 
-新增实验回答：
-
-> Yes. In a three-agent Auto Research workflow involving retrieval, synthesis, and critique, acknowledgment / low-content flow-control pruning reduces LLM invocations and wall-clock latency without degrading answer quality or citation grounding.
+正向 + 反向双向验证远比单向实验更有说服力。
 
 ---
 
-## 4.2 Benchmark 名称
+## 4.2 实验设计
 
-可以命名为：
+### Part A: Ack Injection（正向因果）
 
-- **AutoResearch-CommPrune**
-- **ResearchAgent-CommPrune**
-- **AutoResearch Message Pruning Benchmark**
+从已有 baseline traces 中采样 non-ack 位置，在这些位置插入不同类型消息，然后从插入点之后 regenerate。
+
+条件：
+
+1. Original trace（不插入任何消息）
+2. ACK injection
+3. Neutral injection（控制组）
+4. Flow-control injection
+5. Content-bearing short control（可选）
+
+#### ACK injection examples
+
+```text
+Correct.
+I agree.
+That looks right.
+Yes, proceed.
+The previous step is valid.
+```
+
+#### Neutral injection examples
+
+```text
+[Step recorded.]
+Continue.
+Message received.
+```
+
+#### Flow-control examples
+
+```text
+Proceed to the next step.
+Continue with the calculation.
+Move on to verification.
+```
+
+### Part B: Chain Breaking（反向因果）
+
+从已有 baseline traces 中找到**自然 ack chain 起始位置**（即 ack 后面紧跟 ack 的位置），将该 ack 替换为 content-bearing non-ack 消息，然后从替换点之后 regenerate。
+
+条件：
+
+1. Original trace（保留自然 ack）
+2. Replace ack with content message（例如替换成一句 reasoning guidance 或 verification）
+3. Replace ack with neutral placeholder（控制组）
+4. Simply remove ack（对照 remove ablation）
+
+#### Content replacement examples
+
+```text
+Let me re-examine step 3 more carefully.
+I noticed the calculation in the previous step uses the wrong formula.
+Could you verify whether the final answer matches the constraints?
+```
+
+#### 设计原则
+
+- 替换消息的**长度应与被替换 ack 匹配**（避免引入长度 confound）；
+- 替换位置必须是**confirmed ack chain 的第一个 ack**（即 P(next msg is ack | current msg) > 0.5）；
+- 每条替换消息必须是**语义合理的**（不能是随机文本），否则下游 LLM 可能因为不理解而产生异常行为。
+
+---
+
+## 4.3 指标
+
+核心指标：
+
+- future ack rate in next k messages（k=1, 3, 5）；
+- average ack chain length after intervention point；
+- probability of next message being ack；
+- total number of generated messages；
+- final accuracy / final judge quality；
+- trajectory similarity（cosine similarity of final answers）。
+
+---
+
+## 4.4 推荐结果表
+
+### Part A: Ack Injection
+
+```markdown
+| Intervention | N positions | P(next ack) | Ack rate next-3 | Chain length | Accuracy Δ |
+|---|---:|---:|---:|---:|---:|
+| Original | 500 | 0.31 | 0.28 | 1.4 | 0.0 |
+| Neutral injection | 500 | 0.34 | 0.30 | 1.5 | -0.1 |
+| ACK injection | 500 | 0.58 | 0.51 | 2.3 | +0.0 |
+| Flow-control injection | 500 | 0.40 | 0.36 | 1.7 | -0.2 |
+```
+
+### Part B: Chain Breaking
+
+```markdown
+| Intervention | N positions | P(next ack) | Ack rate next-3 | Chain length | Accuracy Δ |
+|---|---:|---:|---:|---:|---:|
+| Original (natural ack) | 300 | 0.91 | 0.78 | 3.1 | 0.0 |
+| Replace with content | 300 | 0.35 | 0.29 | 1.3 | +0.2 |
+| Replace with neutral | 300 | 0.42 | 0.35 | 1.6 | -0.1 |
+| Simply remove | 300 | 0.38 | 0.31 | 1.4 | +0.1 |
+```
+
+表中数值是期望格式，不是实际结果。
+
+---
+
+## 4.5 主文写法
+
+如果正向 + 反向都显著：
+
+> Controlled insertion of acknowledgment messages causally increased the probability of subsequent acknowledgments (P(next ack): 0.31 → 0.58 for ack injection vs. 0.34 for neutral control), while replacing natural acknowledgments with content messages broke the cascade (P(next ack): 0.91 → 0.35). This bidirectional evidence supports cascade dissolution as a causal mechanism, ruling out a purely correlational interpretation based on message position or dialogue phase.
+
+如果只有正向显著：
+
+> Ack injection causally increased future ack probability, supporting the cascade component. Chain breaking yielded mixed results, suggesting that cascade dynamics depend on both message function and dialogue state.
+
+如果都不显著，写成 limitation：
+
+> Ack injection did not significantly increase future ack probability outside naturally occurring ack-rich phases, suggesting that the sequential dependence observed in correlational analysis may reflect dialogue-phase effects rather than per-message causal chains.
+
+建议**优先在 Qwen/GSM8K 上做**，因为 Qwen 的 cascade rate 最高（90.7%），最可能看到因果效应。
+
+---
+
+## 4.6 计算量估算
+
+- Part A: 500 positions × 4 conditions = 2000 次 regeneration（每次从插入点到对话结束，平均 ~3-5 个 LLM calls）
+- Part B: 300 positions × 4 conditions = 1200 次 regeneration
+- 总计 ~3200 次 partial regeneration，Qwen 7B 在 4×5090 上估计 **6-10 小时**
+- Agent 代码实现 ~2 小时
+
+---
+
+# 5. 实验二：Auto Research Agent Workflow + Cost Profiling
+
+> **注意**：Cost profiling 不作为独立实验，而是作为 Auto Research 实验的内嵌组件。在 Auto Research 的每次 LLM call 中记录完整 timing 和 token 数据即可，零额外计算成本。
+
+## 5.1 目的
+
+证明该现象不是 GSM8K / StrategyQA 这种标准 QA benchmark 中的 toy phenomenon，而是出现在更真实的 LLM agent workflow 中。同时回应 reviewer 对 "36–56% inference-call reduction 是否等价于真实成本下降" 的质疑。
+
+核心 reviewer concerns：
+
+> This is interesting, but does it matter for real agent systems?
+
+> You reduce inference calls, but what about actual wall-clock time and cost?
+
+新增实验回答：
+
+> Yes. In a three-agent Auto Research workflow involving retrieval, synthesis, and critique, acknowledgment pruning reduces LLM invocations by X% and measured wall-clock latency by Y% without degrading answer quality or citation grounding. Token-level savings are smaller because acknowledgments are short, but call-level savings translate to real latency reduction in sequential orchestration.
+
+---
+
+## 5.2 Ack Prevalence 验证（Day 0 关键门控）
+
+**这是整个 Auto Research 实验的最大风险点。** 论文已经证明 ack 是特定 topology 的 emergent property：
+
+- solver-checker: 36–56% ack suppression
+- debate: 0.2% acks
+- code-generation (HumanEval): 4% acks
+
+3-agent research workflow（Retriever → Synthesizer → Critic）的 Critic → Synthesizer 反馈循环接近 solver-checker 结构，但 ack rate 可能只有 15–30%。
+
+### Day 0 必须做的 pilot
+
+在冻结实验矩阵之前，先跑 **10-task smoke test**，检查：
+
+1. ack rate 是否 ≥ 15%；
+2. 如果 < 15%，启用 fallback plan；
+3. 如果 < 5%，放弃 ACK-only target，仅做 ACK+FLOW。
+
+### Fallback plan（如果 ack rate < 15%）
+
+调整 workflow 设计，增加 Critic → Synthesizer 的多轮验证循环：
+
+```text
+User question
+→ Retriever: search plan + retrieved evidence
+→ Synthesizer: draft answer
+→ Critic: critique round 1
+→ Synthesizer: revision 1
+→ Critic: critique round 2 (verify fixes)
+→ Synthesizer: revision 2
+→ Critic: final verification or remaining concerns
+→ Synthesizer: final answer
+```
+
+强制至少 3 轮 revision-verification 循环会模仿 solver-checker 的反复确认模式，增加 ack 产生的机会。
+
+如果 ack rate 仍然低，将**主结论定位为 ACK+FLOW**（扩展到 low-content flow-control 消息），并在论文中明确写：
+
+> In Auto Research workflows, strict acknowledgment prevalence is lower than in solver-checker systems, but broader low-content flow-control messages (acknowledgments + procedural confirmations) exhibit analogous pruning safety.
+
+---
+
+## 5.3 Benchmark 名称
 
 建议主文使用：
 
@@ -169,7 +400,7 @@
 
 ---
 
-## 4.3 任务形式
+## 5.4 任务形式
 
 给定一个 research question，让 agent 从本地论文库中检索、分析、综合，并输出一个 grounded research answer。
 
@@ -184,7 +415,7 @@
 
 ---
 
-## 4.4 任务类型
+## 5.5 任务类型
 
 建议构造 100 个任务，覆盖以下类型：
 
@@ -220,33 +451,28 @@
 
 ---
 
-## 4.5 文档库构造
+## 5.6 文档库构造
 
-五天内不要做复杂 web browsing。建议用固定本地 corpus：
+用固定本地 corpus。Agent 可以在数小时内完成 corpus 构建。
 
-- 30–80 篇 LLM agents / multi-agent communication / token compression / agent pruning / AI scientist 相关论文；
+- 30–80 篇相关论文；
 - 每篇切成 chunks；
 - 建立 BM25 或 embedding retrieval；
 - 每个 task top-k 检索 evidence。
 
-推荐语料：
+### 防止 circularity 的领域覆盖要求
 
-- AutoGen；
-- CAMEL；
-- MetaGPT；
-- AgentVerse；
-- AgentDropout；
-- multi-agent debate；
-- token compression；
-- context compression；
-- message pruning；
-- AI Scientist / auto research；
-- tool-use agent benchmark；
-- communication protocol papers。
+为避免 reviewer 质疑 "用 multi-agent communication 领域的论文测试 multi-agent communication pruning 是 circular evaluation"，**corpus 必须包含多个领域的论文**：
+
+- **主领域**（~40%）：LLM agents, multi-agent communication, agent pruning, token compression
+- **相关领域**（~30%）：AI Scientist, auto research, tool-use agents
+- **泛 AI/ML 领域**（~30%）：NLP (summarization, QA), CV (image captioning), RL (RLHF), 通用 ML (architecture search, hyperparameter tuning)
+
+research questions 也应覆盖这三个层次，确保不是只问 multi-agent communication 的问题。
 
 ---
 
-## 4.6 Agent Workflow 设计
+## 5.7 Agent Workflow 设计
 
 主实验用 3-agent workflow，简单、稳定、可控。
 
@@ -284,17 +510,17 @@ User question
 
 ---
 
-## 4.7 Pruning Targets
+## 5.8 Pruning Targets
 
 ### Target 1: ACK-only
 
 严格 acknowledgment：
 
-- “I agree.”
-- “Correct.”
-- “This looks good.”
-- “The answer is correct.”
-- “No issue found.”
+- "I agree."
+- "Correct."
+- "This looks good."
+- "The answer is correct."
+- "No issue found."
 
 这是和原论文主线一致的 target。
 
@@ -302,13 +528,13 @@ User question
 
 更宽的 low-content flow-control messages：
 
-- “I will now proceed.”
-- “Moving to the next step.”
-- “Let’s continue.”
-- “The retrieved documents seem relevant.”
-- “I will summarize now.”
+- "I will now proceed."
+- "Moving to the next step."
+- "Let's continue."
+- "The retrieved documents seem relevant."
+- "I will summarize now."
 
-注意：ACK+FLOW 应该标成 exploratory，不要让主结论依赖它。
+注意：ACK+FLOW 应该标成 exploratory，不要让主结论依赖它。**除非 pilot 发现 ack rate < 15%，此时 ACK+FLOW 成为主 target。**
 
 推荐写法：
 
@@ -316,26 +542,20 @@ User question
 
 ---
 
-## 4.8 Conditions
+## 5.9 Conditions
 
 主实验条件：
 
 1. Baseline
 2. Oracle ACK pruning
-3. Learned ACK pruning
-4. ACK+FLOW pruning, exploratory
-
-如果时间紧，至少完成：
-
-1. Baseline
-2. Oracle ACK pruning
-3. Heuristic or TF-IDF ACK pruning
+3. Learned ACK pruning（TF-IDF）
+4. ACK+FLOW pruning（exploratory）
 
 ---
 
-## 4.9 评价指标
+## 5.10 评价指标
 
-### 4.9.1 Quality Score
+### 5.10.1 Quality Score
 
 用 LLM judge 打分，维度：
 
@@ -347,7 +567,15 @@ User question
 
 每项 1–5 分。
 
-### 4.9.2 Pairwise Preference
+#### Judge 一致性检验
+
+必须做 judge calibration：
+
+- 随机抽取 20 个 task 的 baseline answer，让 judge 打分两次（不同 prompt order），计算 intra-rater agreement；
+- 如果 agreement < 0.7，调整 judge prompt 或换 judge model；
+- 报告 judge 的 inter-item consistency（Cronbach's α 或 ICC）。
+
+### 5.10.2 Pairwise Preference
 
 让 judge 比较 baseline vs pruned：
 
@@ -357,7 +585,7 @@ User question
 
 必须随机交换 A/B 顺序，防止 position bias。
 
-### 4.9.3 Citation Grounding
+### 5.10.3 Citation Grounding
 
 自动或 judge 检查：
 
@@ -366,68 +594,7 @@ User question
 - hallucinated citation rate；
 - unsupported claim rate。
 
-### 4.9.4 Cost Metrics
-
-必须记录：
-
-- number of LLM calls；
-- input tokens；
-- output tokens；
-- wall-clock latency；
-- request-level latency；
-- GPU time proxy；
-- throughput under batching, optional。
-
----
-
-## 4.10 推荐结果表
-
-```markdown
-| Workflow | Model | Pruning | N | Quality Δ | Pairwise Win/Tie/Loss | Citation Error Δ | Calls ↓ | Output Tokens ↓ | Wall-clock ↓ |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| AutoResearch-3Agent | Qwen2.5-7B | ACK oracle | 100 | +0.02 | 18/67/15 | +0.1% | 35% | 12% | 24% |
-| AutoResearch-3Agent | Qwen2.5-7B | ACK learned | 100 | -0.03 | 16/69/15 | +0.2% | 31% | 10% | 21% |
-| AutoResearch-3Agent | Qwen2.5-7B | ACK+FLOW | 100 | -0.08 | 15/62/23 | +0.5% | 48% | 19% | 33% |
-| AutoResearch-3Agent | Llama-3.1-8B | ACK oracle | 50 | +0.04 | 11/31/8 | -0.1% | 28% | 15% | 19% |
-```
-
-表中数值是期望格式，不是实际结果。
-
----
-
-## 4.11 可接受结果标准
-
-理想结果：
-
-- Calls reduction ≥ 25%；
-- Wall-clock latency reduction ≥ 15%；
-- Pairwise judge 中 tie + pruned win ≥ 70%；
-- Quality Δ 在 ±0.1 / 5 内；
-- Citation hallucination 不显著增加。
-
-如果 ACK+FLOW 有轻微质量下降，也可以作为 boundary condition。
-
-主结论只要 ACK-only 安全即可。
-
----
-
-# 5. 实验二：真实 Cost / Latency Profiling
-
-## 5.1 目的
-
-回应 reviewer 对 “36–56% inference-call reduction 是否等价于真实成本下降” 的质疑。
-
-需要把论文从：
-
-> We reduce inference calls.
-
-升级为：
-
-> We reduce LLM invocations, output tokens, and measured wall-clock latency in a real agent workflow, while noting that token savings are smaller because acknowledgments are short.
-
----
-
-## 5.2 Logging 字段
+### 5.10.4 Cost Metrics（内嵌 Cost Profiling）
 
 每个 task / condition 记录：
 
@@ -456,30 +623,48 @@ User question
 - vLLM reported latency；
 - wall-clock under fixed concurrency。
 
----
-
-## 5.3 实验设置
-
-同一组 AutoResearch 100 tasks：
-
-1. Baseline
-2. ACK oracle pruning
-3. ACK learned pruning
-4. ACK+FLOW pruning, optional
-
-固定：
-
-- same tasks；
-- same retrieval results；
-- same model；
-- same max turns；
-- same decoding setting；
-- same hardware；
-- same batching / concurrency。
+> **实现注意**：这些 logging 只需在 agent workflow 代码中每次 LLM call 前后加 timestamp + token count 记录，Agent 实现 ~30 分钟。
 
 ---
 
-## 5.4 主文写法
+## 5.11 推荐结果表
+
+```markdown
+| Workflow | Model | Pruning | N | Quality Δ | Pairwise Win/Tie/Loss | Citation Error Δ | Calls ↓ | Output Tokens ↓ | Wall-clock ↓ |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| AutoResearch-3Agent | Qwen2.5-7B | ACK oracle | 100 | +0.02 | 18/67/15 | +0.1% | 35% | 12% | 24% |
+| AutoResearch-3Agent | Qwen2.5-7B | ACK learned | 100 | -0.03 | 16/69/15 | +0.2% | 31% | 10% | 21% |
+| AutoResearch-3Agent | Qwen2.5-7B | ACK+FLOW | 100 | -0.08 | 15/62/23 | +0.5% | 48% | 19% | 33% |
+| AutoResearch-3Agent | Llama-3.1-8B | ACK oracle | 50 | +0.04 | 11/31/8 | -0.1% | 28% | 15% | 19% |
+```
+
+表中数值是期望格式，不是实际结果。
+
+---
+
+## 5.12 可接受结果标准
+
+理想结果：
+
+- Calls reduction ≥ 25%；
+- Wall-clock latency reduction ≥ 15%；
+- Pairwise judge 中 tie + pruned win ≥ 70%；
+- Quality Δ 在 ±0.1 / 5 内；
+- Citation hallucination 不显著增加。
+
+如果 ACK+FLOW 有轻微质量下降，也可以作为 boundary condition。
+
+主结论只要 ACK-only 安全即可。
+
+### 如果 ack rate 低导致 call reduction < 15%
+
+这仍然是有价值的结果，可以写成：
+
+> In Auto Research workflows with lower acknowledgment prevalence (~15% vs. ~50% in solver-checker), pruning opportunity is correspondingly reduced but remains non-inferior in quality. This confirms that pruning safety generalizes while pruning yield is topology-dependent.
+
+---
+
+## 5.13 Cost Profiling 主文写法
 
 不要写：
 
@@ -493,103 +678,9 @@ User question
 
 ---
 
-# 6. 实验三：Ack Injection 因果干预
+# 6. 实验三：Position / Length-Matched Non-Ack Control
 
 ## 6.1 目的
-
-当前 cascade dissolution 主要是相关性证据。Ack injection 是五天内最强、最简单的因果实验。
-
-核心问题：
-
-> Does inserting an acknowledgment causally increase the probability of future acknowledgments?
-
----
-
-## 6.2 实验设计
-
-从已有 baseline traces 中采样 non-ack 位置，在这些位置插入不同类型消息，然后从插入点之后 regenerate。
-
-条件：
-
-1. Original trace
-2. ACK injection
-3. Neutral injection
-4. Flow-control injection
-5. Content-bearing short control, optional
-
-### ACK injection examples
-
-```text
-Correct.
-I agree.
-That looks right.
-Yes, proceed.
-The previous step is valid.
-```
-
-### Neutral injection examples
-
-```text
-[Step recorded.]
-Continue.
-Message received.
-```
-
-### Flow-control examples
-
-```text
-Proceed to the next step.
-Continue with the calculation.
-Move on to verification.
-```
-
----
-
-## 6.3 指标
-
-核心指标：
-
-- future ack rate in next k messages；
-- average ack chain length；
-- probability of next message being ack；
-- total number of generated messages；
-- final accuracy / final judge quality；
-- trajectory similarity。
-
----
-
-## 6.4 推荐结果表
-
-```markdown
-| Intervention | N positions | P(next ack) | Ack rate next-3 | Chain length | Accuracy Δ |
-|---|---:|---:|---:|---:|---:|
-| Original | 500 | 0.31 | 0.28 | 1.4 | 0.0 |
-| Neutral injection | 500 | 0.34 | 0.30 | 1.5 | -0.1 |
-| ACK injection | 500 | 0.58 | 0.51 | 2.3 | +0.0 |
-| Flow-control injection | 500 | 0.40 | 0.36 | 1.7 | -0.2 |
-```
-
-表中数值是期望格式，不是实际结果。
-
----
-
-## 6.5 主文写法
-
-如果结果显著，可以写：
-
-> Controlled insertion of acknowledgment messages causally increased the probability of subsequent acknowledgments, supporting the cascade component of our explanation. This intervention rules out a purely correlational interpretation based only on message position or dialogue phase.
-
-如果结果不显著，也可以写成 limitation：
-
-> Ack injection did not significantly increase future ack probability outside naturally occurring ack-rich phases, suggesting that cascade dynamics depend on both message function and dialogue state.
-
-但理想情况下应该先在 Qwen/GSM8K 上做，因为最可能成功。
-
----
-
-# 7. 实验四：Position / Length-Matched Non-Ack Control
-
-## 7.1 目的
 
 排除以下 confounds：
 
@@ -598,9 +689,14 @@ Move on to verification.
 - ack pruning 安全只是因为删少量消息或缩短对话；
 - ack pruning 和 random pruning 没区别。
 
+论文目前有的 confound control 比较弱：
+- Token-matched random：只匹配了总删除量，没匹配位置（Table 2, Qwen 9.9% suppression vs ack 56.3%，差距巨大）；
+- Length-only baseline：Qwen char<30 效果类似 heuristic，但 Llama 几乎无效（0.8% suppression）；
+- 缺少 position-matched 和 speaker-matched 的 non-ack pruning。
+
 ---
 
-## 7.2 实验条件
+## 6.2 实验条件
 
 比较四种 pruning：
 
@@ -608,11 +704,11 @@ Move on to verification.
 2. Random same-count pruning
 3. Position-matched non-ack pruning
 4. Length-matched non-ack pruning
-5. Speaker/round-matched non-ack pruning, optional
+5. Speaker/round-matched non-ack pruning（可选）
 
 ---
 
-## 7.3 Matching 方法
+## 6.3 Matching 方法
 
 对每条 ack message，找一个 non-ack control：
 
@@ -626,18 +722,18 @@ Move on to verification.
 
 ---
 
-## 7.4 指标
+## 6.4 指标
 
 - accuracy delta；
 - final answer flip rate；
 - call reduction；
 - future ack rate；
 - trajectory similarity；
-- judge quality for AutoResearch, optional。
+- judge quality for AutoResearch（可选）。
 
 ---
 
-## 7.5 推荐结果表
+## 6.5 推荐结果表
 
 ```markdown
 | Pruning Target | N tasks | Suppression Rate | Accuracy Δ | Correct→Wrong Flip | Wrong→Correct Flip |
@@ -652,7 +748,7 @@ Move on to verification.
 
 ---
 
-## 7.6 主文写法
+## 6.6 主文写法
 
 理想 claim：
 
@@ -662,17 +758,17 @@ Move on to verification.
 
 ---
 
-# 8. 实验五：Learned Detector 跨域 Online Validation
+# 7. 实验四：Learned Detector 跨域 Online Validation
 
-## 8.1 目的
+## 7.1 目的
 
 减少 reviewer 对 oracle / heuristic 的质疑。
 
 当前问题：
 
 - oracle detector 依赖 GPT-4o；
-- heuristic detector 不迁移；
-- DistilBERT online validation 只在单个 configuration。
+- heuristic detector 不迁移（F1: 0.845 → 0.213）；
+- DistilBERT online validation 只在单个 configuration（Qwen/GSM8K, N=300, seed 42）。
 
 目标：
 
@@ -680,7 +776,7 @@ Move on to verification.
 
 ---
 
-## 8.2 Detector 类型
+## 7.2 Detector 类型
 
 建议训练两个：
 
@@ -688,32 +784,31 @@ Move on to verification.
 
 优点：
 
-- 训练快；
+- 训练快（秒级）；
 - CPU 推理极快；
 - 可解释；
 - deployment 更 practical；
-- 五天内很稳。
+- 论文已有 offline F1=0.859 的结果，只需补 online validation。
 
 ### B. DistilBERT
 
 优点：
 
-- 看起来更 neural；
-- 和当前论文已有结果衔接；
-- F1 可能略高。
+- 论文已有 offline F1=0.867 和单个 online validation 的结果；
+- 和当前论文已有结果衔接。
 
 如果只能选一个，优先 TF-IDF + Logistic Regression，因为稳定且快。
 
 ---
 
-## 8.3 数据
+## 7.3 数据
 
 训练集包括：
 
 - 原 GSM8K traces；
 - StrategyQA traces；
 - ARC traces；
-- AutoResearch traces。
+- AutoResearch traces（新增）。
 
 标签：
 
@@ -724,7 +819,7 @@ Split 必须按 task_id split，避免同一问题的消息泄漏。
 
 ---
 
-## 8.4 Generalization 设置
+## 7.4 Generalization 设置
 
 推荐至少做两个：
 
@@ -746,7 +841,7 @@ Test: 10% tasks
 
 ---
 
-## 8.5 Online Validation
+## 7.5 Online Validation
 
 不要只报 classifier F1。必须 online pruning。
 
@@ -765,7 +860,7 @@ Test: 10% tasks
 
 ---
 
-## 8.6 主文写法
+## 7.6 主文写法
 
 建议写：
 
@@ -781,288 +876,188 @@ Test: 10% tasks
 
 ---
 
-# 9. 实验六：小规模 4-Agent Topology Probe
+# 8. 五天执行计划
 
-## 9.1 目的
+> **核心原则**：Agent 做 coding/writing，GPU 做 inference。并行化 GPU 实验是关键——不同实验可以在 GPU 空闲时段依次执行。
 
-当前论文主要是 two-agent topology。AutoResearch 3-agent 已经补了一部分，但如果资源允许，可以再补一个 4-agent 小规模 probe。
+## Day 0：冻结实验矩阵 + Ack Prevalence Pilot + 代码骨架
 
-目的不是证明 universal，而是说明：
+目标：防止发散，**并验证 Auto Research workflow 的 ack rate**。
 
-> pruning opportunity depends on topology-induced acknowledgment prevalence.
+### 关键门控：10-task Pilot
 
----
+Agent 在数小时内搭建 3-agent workflow 基础代码，然后立即跑 10-task pilot：
 
-## 9.2 4-Agent Workflow
-
-1. Planner
-2. Retriever
-3. Writer / Synthesizer
-4. Critic / Verifier
-
-流程：
-
-```text
-Planner: decomposes research question
-Retriever: collects evidence
-Writer: drafts answer
-Critic: critiques answer
-Writer: revises answer
-Critic: verifies final answer
-```
-
----
-
-## 9.3 实验规模
-
-- N = 30 tasks；
-- Qwen2.5-7B；
-- baseline vs ack pruning；
-- report quality + calls + latency。
-
----
-
-## 9.4 推荐表
-
-```markdown
-| Topology | Task | N | Ack Rate | Quality / Accuracy Δ | Calls ↓ | Wall-clock ↓ |
-|---|---|---:|---:|---:|---:|---:|
-| 2-agent solver-checker | GSM8K | 500 | high | +0.4 pp | 56% | — |
-| 3-agent research | AutoResearch | 100 | medium | -0.02 / 5 | 35% | 24% |
-| 4-agent research | AutoResearch | 30 | medium-high | -0.05 / 5 | 41% | 27% |
-| debate-like | QA | 100 | low | N/A | low | low |
-```
-
----
-
-## 9.5 主文写法
-
-> Ack pruning is not universally useful; it is useful in acknowledgment-rich feedback topologies. Topologies with near-zero acknowledgment prevalence naturally provide little pruning opportunity.
-
-这会把 limitation 变成适用条件。
-
----
-
-# 10. 五天执行计划
-
-## Day 0：冻结实验矩阵与代码接口
-
-目标：防止发散。
-
-当天必须确定：
-
-- AutoResearch task set；
-- document corpus；
-- agent workflow；
-- pruning targets；
-- logging schema；
-- judge prompt；
-- experiment matrix。
+- 如果 ack rate ≥ 15%：继续原计划
+- 如果 ack rate 10–15%：增加 Critic-Synthesizer 循环轮次（见 §5.2 fallback plan）
+- 如果 ack rate < 10%：切换到 ACK+FLOW 作为主 target
+- 如果 ack rate < 5%：放弃 Auto Research ACK-only，聚焦因果实验 + matched controls
 
 ### 当天冻结的最小实验矩阵
 
 | Experiment | N | Model | Conditions |
 |---|---:|---|---|
+| Ack injection + chain breaking | 500+300 positions | Qwen2.5-7B | original / ACK inject / neutral inject / chain break |
 | AutoResearch 3-agent | 100 | Qwen2.5-7B | baseline / ACK / ACK+FLOW |
 | AutoResearch 3-agent | 50 | Llama-3.1-8B | baseline / ACK |
-| Cost profiling | 100 | Qwen2.5-7B | baseline / ACK / ACK+FLOW |
-| Ack injection | 500 positions | Qwen2.5-7B | original / ACK inject / neutral inject |
+| Cost profiling（内嵌） | 100 | Qwen2.5-7B | baseline / ACK / ACK+FLOW |
 | Position-matched pruning | 300–500 tasks | Qwen2.5-7B | ACK / random / matched non-ack |
 | Learned detector online | 100–300 tasks | Qwen + Llama | TF-IDF / DistilBERT |
 
-### 当天产出
+### 当天 Agent 产出
 
-- `tasks.jsonl`
-- `corpus/`
-- `agent_workflow.py`
-- `pruning_policy.py`
+- `tasks.jsonl`（100 个 research questions）
+- `corpus/`（多领域论文 corpus）
+- `agent_workflow.py`（3-agent workflow + logging）
+- `pruning_policy.py`（ACK / ACK+FLOW / oracle / learned）
 - `logging_schema.json`
-- `judge_prompt.txt`
+- `judge_prompt.txt`（含 calibration 检验设计）
 - `run_matrix.yaml`
+- `ack_injection.py`（因果实验代码）
+- `chain_breaking.py`（反向因果实验代码）
+- `matched_control.py`（matched pruning 代码）
+- **10-task pilot 结果** + ack rate 确认
 
 ---
 
-## Day 1：搭建 AutoResearch Benchmark 和 Logging
+## Day 1：因果实验（GPU 密集）+ AutoResearch Benchmark 完善
 
-### 上午
+### GPU 任务（排队执行）
 
-构造 100 个 research questions。
+1. **Ack injection**（Qwen/GSM8K, 500 positions × 4 conditions）
+2. **Chain breaking**（Qwen/GSM8K, 300 positions × 4 conditions）
 
-方法：
+### Agent 并行任务
 
-1. 先用 LLM 生成 150 个；
-2. 人工筛到 100 个；
-3. 保证每个问题能从 local corpus 中找到 evidence；
-4. 每个问题分配 task type。
-
-### 下午
-
-实现 3-agent workflow。
-
-必须确保：
-
-- 每条 message 都记录 speaker、round、content、tokens、latency；
-- 每次 LLM call 都记录开始/结束时间；
-- pruning policy 可以在线拦截 message；
-- final answer 单独保存。
+- 完善 100 个 research questions（LLM 生成 150 → 筛选到 100）；
+- 完善 corpus（确保多领域覆盖）；
+- 完善 3-agent workflow 代码（基于 pilot 调整）；
+- 实现 judge 评价代码 + calibration 检验。
 
 ### 晚上
 
-跑 10-task smoke test。
-
-检查：
-
-- 是否有足够 ack / flow messages；
-- 是否出现无限循环；
-- final answer 是否格式稳定；
-- judge 是否能解析；
-- latency logging 是否正确。
+- 分析因果实验结果；
+- 如果因果实验显著，确认 cascade dissolution 的因果证据；
+- 如果不显著，调整 claim 并开始准备 limitation 写法。
 
 ---
 
-## Day 2：跑 AutoResearch 主实验 + Judge
+## Day 2：AutoResearch 主实验 + Matched Controls
 
-### 白天
+### GPU 任务（排队执行）
 
-运行：
+1. **AutoResearch baseline**（Qwen, 100 tasks）
+2. **AutoResearch ACK pruning**（Qwen, 100 tasks）
+3. **AutoResearch ACK+FLOW**（Qwen, 100 tasks）
+4. **Position/length-matched controls**（Qwen/GSM8K, 500 tasks × 4 conditions）
 
-- Qwen2.5-7B，100 tasks；
-- baseline / ACK pruning / ACK+FLOW pruning；
-- 如果资源允许，Llama-3.1-8B，50 tasks。
+### Agent 并行任务
+
+- 整理 Day 1 因果实验结果为论文 section 草稿；
+- 准备 matched controls 的 matching 代码。
 
 ### 晚上
 
-运行 judge：
-
-- scalar scores；
-- pairwise preference；
-- citation grounding；
-- unsupported claim check。
+- AutoResearch Llama 50 tasks（如果 GPU 空闲）；
+- 运行 judge 评价：scalar scores、pairwise preference、citation grounding。
 
 ### 当天产出
 
-- AutoResearch 主结果表；
-- cost profiling 表；
-- judge win/tie/loss 表；
-- quality distribution plot；
-- latency distribution plot。
+- 因果实验主结果表；
+- AutoResearch 主结果表（含 cost profiling）；
+- Matched controls 结果表。
 
 ---
 
-## Day 3：因果实验 + Matched Controls
-
-### 上午：Ack Injection
-
-运行：
-
-- Qwen/GSM8K 或 Qwen/AutoResearch traces；
-- 500 sampled positions；
-- original / ACK injection / neutral injection。
-
-输出：
-
-- P(next ack)；
-- next-3 ack rate；
-- chain length；
-- accuracy / quality Δ。
-
-### 下午：Position / Length-Matched Non-Ack Pruning
-
-运行：
-
-- ACK pruning；
-- random same-count；
-- position-matched non-ack；
-- length-matched non-ack。
-
-输出：
-
-- accuracy delta；
-- correct→wrong flip；
-- wrong→correct flip；
-- suppression rate。
-
-### 晚上
-
-整理成机制证据：
-
-1. ACK injection causally increases future ack probability；
-2. ACK pruning is safer than matched non-ack pruning；
-3. therefore not just position / length / random shortening。
-
----
-
-## Day 4：Learned Detector + 4-Agent Probe
+## Day 3：Learned Detector + Judge 评价 + 结果整理
 
 ### 上午
 
-训练：
+训练 learned detectors：
 
-- TF-IDF + Logistic Regression；
-- DistilBERT, optional。
+- TF-IDF + Logistic Regression（秒级训练）；
+- DistilBERT（如已有代码，直接复用论文已有的训练 pipeline）。
 
 数据：
 
-- existing reasoning traces；
-- AutoResearch traces。
+- existing reasoning traces + AutoResearch traces。
 
 评估：
 
 - held-out F1；
-- cross-domain F1；
-- cross-backbone F1。
+- cross-domain F1（train: GSM8K+StratQA, test: AutoResearch）；
+- cross-backbone F1（train: Qwen, test: Llama）。
 
 ### 下午
 
-Online validation：
+Online validation（GPU 任务）：
 
 - AutoResearch 100 tasks, TF-IDF pruning；
 - StrategyQA 200 tasks, TF-IDF pruning；
-- Llama GSM8K 200 tasks, optional。
+- Llama GSM8K 200 tasks（可选）。
 
 ### 晚上
 
-4-agent probe, optional：
-
-- 30 AutoResearch tasks；
-- baseline vs ACK pruning；
-- quality / calls / latency。
+- 整理所有结果表；
+- 确认所有数字一致性；
+- 绘制关键图表。
 
 ---
 
-## Day 5：重写论文与做图
+## Day 4–5：论文重写 + 图表 + 最终检查
 
-这一天不要再大规模跑实验，除非补缺失表格。
+Agent 可以在数小时内完成全部写作。不需要再大规模跑实验，除非补缺失数据。
 
 ### 必须完成的写作改动
 
-1. Abstract 重写；
-2. Introduction 重写；
-3. Contributions 重写；
-4. 新增 AutoResearch section；
-5. 新增 causal intervention section；
-6. 新增 measured efficiency section；
-7. Discussion 降调 claim；
-8. Limitation 更诚实但更主动；
-9. Related work 加 Auto Research / AI Scientist / agent workflow 相关 work；
-10. Appendix 加 task examples、judge prompt、logging details。
+1. Abstract 重写（含真实实验数字）；
+2. Introduction 重写（新叙事结构）；
+3. Contributions 重写（四条新 contributions）；
+4. 新增 Auto Research section（主文，~1.5 页）；
+5. 新增 causal intervention section（主文，~1 页）；
+6. 新增 measured efficiency section（可融入 Auto Research section）；
+7. 新增 matched controls section（主文，~0.5 页）；
+8. Discussion 降调 claim；
+9. Limitation 更诚实但更主动；
+10. Related work 加 Auto Research / AI Scientist / agent workflow 相关 work；
+11. Appendix 加 task examples、judge prompt、logging details、chain breaking details。
+
+### NeurIPS 页数适配
+
+当前主文约 14 页（到 references 之前），NeurIPS 2026 通常限制 9 页主文（+ references + appendix 不限）。新增 ~3 页内容意味着需要大幅压缩。
+
+建议：
+
+- **移入 appendix**：当前 §5.3 Backbone Communication Typology 的详细分析、§5.5 Boundary Conditions 的大部分细节、length-only baseline 讨论；
+- **保留在主文**：Auto Research 实验（~1.5 页）、causal intervention（~1 页）、matched controls（~0.5 页）；
+- **压缩**：当前 §4 Experimental Setup 可以精简（部分实现细节移到 appendix）；
+- **合并**：Cost profiling 融入 Auto Research section，不单独占 section。
+
+### Day 5 检查清单
+
+- [ ] 所有数字与实验结果一致
+- [ ] 所有表格引用正确
+- [ ] Abstract 中的 X% / Y% 替换为真实数字
+- [ ] NeurIPS 格式检查（页数、字体、margin）
+- [ ] Appendix 中补充完整的 task examples、judge prompt、logging schema
+- [ ] 确认 contribution 写法与实际结果匹配（不 overclaim）
 
 ---
 
-# 11. 新增图表清单
+# 9. 新增图表清单
 
-## Table 1: AutoResearch Main Results
+## Table 1: Causal Intervention (Ack Injection + Chain Breaking)
+
+```markdown
+| Intervention | Direction | N positions | P(next ack) | Next-3 Ack Rate | Chain Length | Accuracy / Quality Δ |
+|---|---|---:|---:|---:|---:|---:|
+```
+
+## Table 2: AutoResearch Main Results (含 Cost Profiling)
 
 ```markdown
 | Workflow | Model | Pruning | N | Quality Δ | Pairwise Win/Tie/Loss | Grounding Error Δ | Calls ↓ | Tokens ↓ | Wall-clock ↓ |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-```
-
-## Table 2: Causal Intervention
-
-```markdown
-| Intervention | N positions | P(next ack) | Next-3 Ack Rate | Chain Length | Accuracy / Quality Δ |
-|---|---:|---:|---:|---:|---:|
 ```
 
 ## Table 3: Matched Controls
@@ -1088,7 +1083,8 @@ Trace collection
 → Function annotation
 → Single-message perturbation
 → Aggregate pruning
-→ Causal intervention
+→ Causal intervention (ack injection + chain breaking)
+→ Matched controls
 → AutoResearch validation
 → Measured efficiency
 ```
@@ -1101,8 +1097,11 @@ Trace collection
 single ack removal
 → high local trajectory perturbation
 
-ack-rich feedback loop
-→ self-reinforcing cascade
+ack injection at non-ack position
+→ causally increases future ack rate (cascade induction)
+
+ack replacement with content at ack position
+→ causally breaks cascade (chain breaking)
 
 aggregate ack pruning
 → cascade dissolution
@@ -1113,11 +1112,12 @@ aggregate ack pruning
 
 x-axis: call reduction  
 y-axis: quality delta  
-points: different pruning policies
+points: different pruning policies (ACK, ACK+FLOW, random, position-matched, length-matched)  
+annotations: Auto Research vs. GSM8K vs. StrategyQA
 
 ---
 
-# 12. 新标题建议
+# 10. 新标题建议
 
 ## 推荐标题
 
@@ -1131,21 +1131,21 @@ points: different pruning policies
 
 **Pruning Redundant Communication in LLM Research Agents via Functional Message Analysis**
 
-推荐第一版，因为更 general，也更像 NeurIPS。
+推荐第一版，因为更 general，也更像 NeurIPS。从 "Two-Agent LLM Systems" 到 "LLM Agent Systems" 的升级前提是确实加了 3-agent Auto Research 实验。
 
 ---
 
-# 13. 新摘要草案
+# 11. 新摘要草案
 
 ```text
-LLM agent systems often communicate through many low-content messages, such as acknowledgments and flow-control confirmations. Are such messages functionally necessary or merely structural artifacts of multi-agent interaction? We uncover a perturbation-pruning dissociation: acknowledgment messages are among the most disruptive when removed individually, yet can be safely pruned in aggregate. We first establish this phenomenon in two-agent solver-checker systems across Qwen and Llama backbones and multiple reasoning domains. We then validate it in a three-agent Auto Research workflow involving retrieval, synthesis, and critique, where acknowledgment pruning reduces LLM invocations by X% and measured wall-clock latency by Y% without degrading judge-rated answer quality or citation grounding. Controlled interventions show that injecting acknowledgments causally increases subsequent acknowledgment probability, while matched non-ack controls support a cascade-dissolution mechanism. Finally, lightweight learned detectors approximate oracle pruning across domains, reducing dependence on hand-crafted heuristics. Our results show that local perturbation sensitivity can overestimate global communication necessity, and provide a practical analysis protocol for identifying safely prunable message functions in LLM agent systems.
+LLM agent systems often communicate through many low-content messages, such as acknowledgments and flow-control confirmations. Are such messages functionally necessary or merely structural artifacts of multi-agent interaction? We uncover a perturbation-pruning dissociation: acknowledgment messages are among the most disruptive when removed individually, yet can be safely pruned in aggregate. We first establish this phenomenon in two-agent solver-checker systems across Qwen and Llama backbones and multiple reasoning domains. We then validate it in a three-agent Auto Research workflow involving retrieval, synthesis, and critique, where acknowledgment pruning reduces LLM invocations by X% and measured wall-clock latency by Y% without degrading judge-rated answer quality or citation grounding. Controlled causal interventions—acknowledgment injection and chain breaking—show that acknowledgments causally induce self-reinforcing cascades, and matched non-ack controls confirm that pruning safety is function-specific rather than an artifact of message position or length. Lightweight learned detectors approximate oracle pruning across domains, reducing dependence on hand-crafted heuristics. Our results show that local perturbation sensitivity can overestimate global communication necessity, and provide a practical analysis protocol for identifying safely prunable message functions in LLM agent systems.
 ```
 
 注意：X/Y 必须替换成真实实验结果。
 
 ---
 
-# 14. Introduction 重写结构
+# 12. Introduction 重写结构
 
 ## Paragraph 1: 真实 agent motivation
 
@@ -1153,7 +1153,7 @@ LLM agent systems often communicate through many low-content messages, such as a
 
 ## Paragraph 2: 现有方法缺口
 
-现有 efficiency 方法多关注 token compression、context compression、agent pruning、topology optimization、turn-level stopping，但较少分析 message function。尤其缺少对“某类消息是否功能必要”的系统性分析。
+现有 efficiency 方法多关注 token compression、context compression、agent pruning、topology optimization、turn-level stopping，但较少分析 message function。尤其缺少对"某类消息是否功能必要"的系统性分析。
 
 ## Paragraph 3: 核心反直觉现象
 
@@ -1161,7 +1161,7 @@ LLM agent systems often communicate through many low-content messages, such as a
 
 ## Paragraph 4: 机制假设
 
-acknowledgment 形成 self-reinforcing cascade。单独删除会打断局部 autoregressive conditioning，因此造成轨迹扰动；整体删除则使 cascade 消失，不会累积错误。
+acknowledgment 形成 self-reinforcing cascade。单独删除会打断局部 autoregressive conditioning，因此造成轨迹扰动；整体删除则使 cascade 消失，不会累积错误。**因果实验（ack injection + chain breaking）为这一机制提供了干预性证据。**
 
 ## Paragraph 5: 本文贡献
 
@@ -1169,9 +1169,9 @@ acknowledgment 形成 self-reinforcing cascade。单独删除会打断局部 aut
 
 ---
 
-# 15. Discussion 改写原则
+# 13. Discussion 改写原则
 
-## 15.1 降调 claim
+## 13.1 降调 claim
 
 不要写：
 
@@ -1195,11 +1195,13 @@ acknowledgment 形成 self-reinforcing cascade。单独删除会打断局部 aut
 
 改成：
 
-> Controlled interventions support cascade dissolution as a plausible mechanism, but further work is needed to fully characterize its causal structure across architectures.
+> Controlled interventions—ack injection and chain breaking—support cascade dissolution as the primary mechanism, though further work is needed to fully characterize its causal structure across architectures.
+
+> **注意**：如果因果实验结果弱，则进一步降调为 "provide partial support for" 而非 "support"。
 
 ---
 
-## 15.2 把 limitation 变成适用条件
+## 13.2 把 limitation 变成适用条件
 
 当前 limitation：
 
@@ -1215,63 +1217,74 @@ acknowledgment 形成 self-reinforcing cascade。单独删除会打断局部 aut
 
 这样 reviewer 会觉得作者理解适用范围。
 
+### 新增适用条件（来自 Auto Research 实验）
+
+如果 Auto Research 的 ack rate 比 solver-checker 低：
+
+> Auto Research workflows exhibit lower acknowledgment prevalence (~15-25%) than solver-checker systems (~50%), resulting in proportionally smaller but still meaningful call reductions. This confirms that pruning yield scales with acknowledgment prevalence, providing practitioners a simple diagnostic (measure ack rate) to predict deployment value.
+
 ---
 
-# 16. 不建议五天内做的事情
+# 14. 不建议五天内做的事情
 
-## 16.1 不要大规模跑 72B
+## 14.1 不要做 4-agent topology probe
 
-2–4 张 5090 跑 72B 不划算。当前 72B probe 已经够作为 preliminary evidence。新增 AutoResearch 和因果实验更能涨分。
+原方案建议 30 tasks 的 4-agent probe。但 N=30 的统计检验力太弱，无法支撑任何有意义的结论。3-agent Auto Research 已经足够证明 "beyond two-agent"。如果想展示 topology 的影响，用论文已有的 debate (0.2% ack) 和 code-generation (4% ack) 作为 negative examples 即可。
 
-## 16.2 不要构造很大的新 benchmark
+## 14.2 不要大规模跑 72B
+
+2–4 张 5090 跑 72B 不划算。当前 72B probe 已经够作为 preliminary evidence（Δ=+0.0pp, N=265, p=1.000）。新增 AutoResearch 和因果实验更能涨分。
+
+## 14.3 不要构造很大的新 benchmark
 
 100 个高质量 AutoResearch tasks 足够。不要追求 1000 个粗糙任务。
 
-## 16.3 不要扩 taxonomy 到十几类
+## 14.4 不要扩 taxonomy 到十几类
 
-五分类已经有一致性问题。扩 taxonomy 会制造新风险。
+五分类已经有一致性问题（information_provision κ=0.237）。扩 taxonomy 会制造新风险。
 
-## 16.4 不要继续只加 GSM8K seed
+## 14.5 不要继续只加 GSM8K seed
 
 当前 GSM8K 10-seed 已经比较强。继续加 seed 对分数提升有限。
 
-## 16.5 不要过度优化 heuristic
+## 14.6 不要过度优化 heuristic
 
 heuristic non-transferability 已经被发现。更好的策略是转向 learned detector + empirical screening。
 
 ---
 
-# 17. 最小可行版本
+# 15. 最小可行版本
 
-如果五天里工程阻力很大，最低限度完成以下五件事：
+即使在 Agent Auto Research 高速执行下，仍需设定最低标准以防 GPU 故障或实验失败：
 
-1. AutoResearch 50 tasks，Qwen2.5-7B，baseline vs ACK pruning；
-2. 报告 calls、tokens、wall-clock latency；
-3. 做 LLM judge pairwise win/tie/loss；
-4. 做 GSM8K 上的 ACK injection causal experiment；
-5. 做 GSM8K 上的 position-matched non-ack control。
+1. GSM8K 上的 ACK injection causal experiment（500 positions, Qwen）；
+2. GSM8K 上的 chain breaking experiment（300 positions, Qwen）；
+3. GSM8K 上的 position-matched non-ack control（500 tasks）；
+4. AutoResearch 50 tasks，Qwen2.5-7B，baseline vs ACK pruning；
+5. 报告 calls、tokens、wall-clock latency；
+6. 做 LLM judge pairwise win/tie/loss。
 
-只要这五项完成，论文就会比当前版本强很多。
-
----
-
-# 18. 理想完成版本
-
-理想五天产出：
-
-1. AutoResearch 100 tasks, Qwen2.5-7B；
-2. AutoResearch 50 tasks, Llama-3.1-8B；
-3. AutoResearch ACK + ACK/FLOW pruning；
-4. cost profiling；
-5. ACK injection；
-6. position / length matched controls；
-7. TF-IDF learned detector online validation；
-8. 4-agent probe；
-9. 完整论文重写。
+只要这六项完成，论文就会比当前版本显著增强——因果机制和 confound control 是当前版本最大的 gap。
 
 ---
 
-# 19. 预期分数提升
+# 16. 理想完成版本
+
+Agent Auto Research 高速执行下的理想五天产出：
+
+1. ACK injection 因果实验（Qwen/GSM8K, 500 positions）；
+2. Chain breaking 反向因果实验（Qwen/GSM8K, 300 positions）；
+3. Position / length matched controls（Qwen/GSM8K, 500 tasks）；
+4. AutoResearch 100 tasks, Qwen2.5-7B（baseline / ACK / ACK+FLOW）；
+5. AutoResearch 50 tasks, Llama-3.1-8B（baseline / ACK）；
+6. 内嵌 cost profiling（全部 Auto Research 实验自动记录）；
+7. TF-IDF learned detector 跨域 online validation；
+8. 完整论文重写（abstract, intro, contributions, 新 sections, discussion）；
+9. NeurIPS 格式适配（9 页主文 + appendix）。
+
+---
+
+# 17. 预期分数提升
 
 ## 当前版本预期
 
@@ -1284,42 +1297,46 @@ heuristic non-transferability 已经被发现。更好的策略是转向 learned
 
 ## 完成最小可行版本后
 
-- Quality: 3
+- Quality: 3–4（因果实验 + matched controls 显著提升）
 - Clarity: 3
 - Significance: 3
 - Originality: 3
-- Overall: 5.5–6
-- 倾向：borderline / weak accept 边缘
+- Overall: 6
+- 倾向：borderline accept
 
 ## 完成理想版本后
 
 如果结果漂亮：
 
-- AutoResearch call reduction > 30%；
-- wall-clock reduction > 20%；
+- ACK injection 显著增加 future ack rate（P(next ack) 提升 > 0.15）；
+- Chain breaking 显著降低 future ack rate；
+- Matched non-ack pruning 明显更差（accuracy drop > 2pp vs ack pruning）；
+- AutoResearch call reduction > 20%；
+- wall-clock reduction > 15%；
 - judge tie + pruned win > 70%；
 - citation grounding 不下降；
-- ack injection 显著增加 future ack rate；
-- matched non-ack pruning 明显更差；
 
 则可能达到：
 
+- Quality: 4
+- Significance: 3–4
 - Overall: 6.5–7
 - 倾向：weak accept / accept 边缘
 
 ---
 
-# 20. 最终优先级总结
+# 18. 最终优先级总结
 
 五天内真正应该做的是：
 
-1. **把场景从 toy solver-checker 扩展到 Auto Research agent workflow。**
-2. **把“省 inference calls”变成真实 latency / cost profiling。**
-3. **把 cascade dissolution 从相关性提升到因果干预支持。**
-4. **用 matched controls 排除 position / length / random shortening confound。**
-5. **用 lightweight learned detector 减少 oracle / heuristic 依赖。**
+1. **用 ack injection + chain breaking 把 cascade dissolution 从相关性提升到因果干预支持。**（P0，直接回应论文最大弱点）
+2. **把场景从 toy solver-checker 扩展到 Auto Research agent workflow，同时内嵌真实 latency / cost profiling。**（P0，同时解决 toy benchmark 和效率收益两个短板）
+3. **用 matched controls 排除 position / length / random shortening confound。**（P1，排除 confound）
+4. **用 lightweight learned detector 减少 oracle / heuristic 依赖。**（P2，补充 deployment story）
+5. **重写论文叙事，升级 contributions，适配 NeurIPS 格式。**（P1，和新增证据量匹配的叙事升级）
+
+**不做**：4-agent probe（统计检验力不足）、大规模 72B 实验、taxonomy 扩展。
 
 最终论文应该传达的核心思想是：
 
-> 单条消息的局部扰动敏感性不等于它的全局功能必要性。Acknowledgment 是这个现象的典型案例。在 acknowledgment-rich 的 LLM agent feedback workflow 中，系统性剪掉这类低内容消息可以让通信 cascade 消失，从而降低调用成本，同时保持最终输出质量。
-
+> 单条消息的局部扰动敏感性不等于它的全局功能必要性。Acknowledgment 是这个现象的典型案例。因果实验表明 acknowledgment 会引发自强化 cascade，而整体剪枝使 cascade 消失。在 acknowledgment-rich 的 LLM agent feedback workflow（从 two-agent solver-checker 到 three-agent Auto Research）中，系统性剪掉这类低内容消息可以降低调用成本和实际延迟，同时保持最终输出质量。
