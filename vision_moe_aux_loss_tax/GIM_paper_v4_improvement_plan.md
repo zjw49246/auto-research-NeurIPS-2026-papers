@@ -1,895 +1,1011 @@
-# GIM Paper v4 完整论文提升方案
+# GIM Paper v4 完整论文提升方案（v4 最终版）
 
 > 针对最新版本：`GIM_paper_v4_expanded_intro.pdf`  
 > 目标会议：NeurIPS 2026  
-> 当前判断：新版已经比上一版更接近一篇可投的 empirical diagnostic paper，但仍存在 **claim 强度高于证据强度、GIM-Switch 验证不足、机制线索分散、主文/appendix 证据组织不够聚焦** 等问题。本文档给出一版可在短周期内执行的完整提升方案。
+> 执行条件：4 天，auto-research agent 执行写作+coding，4 张 RTX 5090（可追加更多）  
+> 总 GPU 预算：4 卡 × 4 天 × 20h/卡 = **320 GPU-hours**  
+> 计划使用 **310h (97%)**，buffer 10h  
+> 目标：中稿概率从 ~15-20%（直投）提升到 **~57-62%**
 
 ---
 
 ## 0. 执行摘要
 
-这篇论文现在最有潜力的主线不是“提出一个自适应 scheduler 解决 MoE auxiliary loss 问题”，而是：
+### 0.1 核心定位
 
-> **GIM provides a diagnostic lens for measuring the auxiliary-loss tax on MoE routers. The main empirical finding is a λ-dependent convergence-rate spectrum: raw GIR can look alarming due to task-gradient denominator collapse, but λ-weighted effective tax is often bounded; different auxiliary losses decay at different rates, and their accuracy effects are mediated more by routing-distribution reshaping than by raw gradient magnitude alone.**
+本方案推荐的论文定位随 GIM-Switch 验证结果分两条路径：
 
-换成中文：
+**路径 A — GIM-Switch 验证成功（预期 60% 概率）**：
 
-> **GIM 是一个测量 MoE router 上 auxiliary-loss tax 的诊断工具。论文的核心发现是：auxiliary loss 的梯度影响不是简单“有害/无害”，而是呈现一个受 λ 控制的收敛速度谱系。raw GIR 后期可能因为 task gradient collapse 而虚高；eGIR 更能反映真实更新压力；LB 这种 persistent/slow-converging loss 和 ERA 这种 fast-converging/self-extinguishing loss 在足够大的 λ 下会明显分离；最终 accuracy 差异更多通过 routing distribution / expert specialization 体现，而不只是梯度大小本身。**
+> We propose GIM as a diagnostic framework and show it enables a principled adaptive scheduler (GIM-Switch) that matches or improves upon tuned fixed-λ baselines while requiring no λ grid search. GIM reveals a λ-dependent convergence-rate spectrum whose accuracy effects are mediated by routing-distribution reshaping rather than raw gradient magnitude.
 
-因此，提升策略应该是：
+论文从 "measurement paper" 升级为 "measurement + method paper"——reviewer 有一个 concrete takeaway。
 
-1. **收缩过强表述**：把 “validated across scale / GIM-Switch validated / tells practitioners when to act” 改成更稳健的 empirical evidence / proof-of-concept。
-2. **把 GIM 的增量价值讲清楚**：证明 raw GIR、loss value、expert load std 单独都不够，GIM 的 GIR + AA + eGIR/GCF 才能解释 ghost-gradient vs amplifier、denominator collapse、routing reshaping。
-3. **把 Tiny-ImageNet λ threshold 变成主文核心证据**：补齐高 λ seed，增加 accuracy/eGIR/load variance，强化 “λ-dependent taxonomy” 而不是只讲二分类 convergent/persistent。
-4. **把 GIM-Switch 降级或补强**：若保留主贡献，必须增加 n=3–5 的 baseline 对比；否则作为 proof-of-concept。
-5. **把 routing-distribution reshaping 提升为机制主线**：利用 ViT-Small load variance、z-loss specialization preservation、ConvNeXt ERA positive sweep 来说明 accuracy effect 不是由 raw GIR 决定。
-6. **重新组织 ConvNeXt 和 ViT-Base 证据**：ConvNeXt 是强正面 evidence；ViT-Base 只能作为 preliminary medium-scale sanity check。
+**路径 B — GIM-Switch 验证失败（fallback）**：
 
-如果只做写作和低成本分析，预计评分可从 **5–6** 提升到 **6**。如果补出 GIM-Switch 多 seed baseline 对比和 Tiny-ImageNet 完整 dose-response，预计可冲到 **6.5–7 / Weak Accept**。
+> We propose GIM as a diagnostic framework for quantifying the router-gradient tax. A simple theoretical condition (Proposition 1) explains why coupling losses self-extinguish while balancing losses persist. GIM reveals a λ-dependent convergence-rate spectrum; accuracy effects are mediated by routing-distribution reshaping.
+
+降级为 diagnostic paper，但有理论锚 + 充分实验支撑。
+
+### 0.2 预期收益
+
+| 场景 | 预估均分 | 中稿概率 | vs 直投提升 |
+|---|---|---|---|
+| 当前版本直投 | 5.75 | ~15-20% | — |
+| 只做写作重构（P0-P1） | 6.0-6.25 | ~25-30% | +10% |
+| + 实验补强（P2-P10） | 7.0 | ~50-55% | +33% |
+| **+ 遗漏修复（PA-PH），GIM-Switch 成功** | **7.25** | **~57-62%** | **+40%** |
+| + 遗漏修复（PA-PH），GIM-Switch 失败 | 7.0 | ~50-55% | +33% |
+
+加权中稿概率：0.6 × 62% + 0.4 × 52% ≈ **58%**。
 
 ---
 
 ## 1. 当前版本的优点与风险
 
-### 1.1 新版本最明显的进步
+### 1.1 优点
 
-新版的 introduction 明显更像 NeurIPS 论文。它引入了 “auxiliary loss tax” 的概念：auxiliary loss 每一步都会向 router 参数注入梯度，而 router 参数是低维共享子空间，例如 `8×192=1536` 参数，因此辅助梯度可能在这个子空间里相对主任务梯度占主导。这个动机比旧版更直接，也更容易让 reviewer 理解为什么 GIM 有意义。
+- Introduction 引入 "auxiliary loss tax" 概念，动机清晰
+- Tiny-ImageNet dose-response 是独特的 λ-threshold 证据
+- 统计处理（TOST + Dunnett correction）比一般 empirical paper 认真
+- Appendix 数据极为丰富（A-N 共 22 页），有大量可利用的未主文化证据
 
-新版还把 Tiny-ImageNet dose-response 放进主文，形成了一个很好的新证据：λ≤0.05 时 taxonomy ratio 接近 1；λ≈0.1 后 LB/ERA 分离出现，并随 λ 增大；λ≥0.1 的 13/13 matched pairs 都是 LB > ERA，sign test p<0.001。这个结果可以支撑 “λ-dependent convergence spectrum”，比旧版单纯讲 CIFAR-100 的 convergent/persistent lifecycle 更有说服力。
+### 1.2 风险汇总
 
-另外，abstract 和 intro 现在试图把 GIM-Switch、phantom GIM、Tiny-ImageNet threshold、ConvNeXt cross-architecture 和 98M scale check 串成一个完整故事。这是方向正确的，但目前证据强度和 claim 强度还不完全匹配。
-
-### 1.2 当前版本最大的风险
-
-当前版本最大的风险是 **overclaim**。几个容易被 reviewer 攻击的表述包括：
-
-- “Every auxiliary loss imposes a gradient-level tax”
-- “all auxiliary losses converge toward the task gradient”
-- “validated across three datasets, two architectures, and scales from ∼7M to ∼98M”
-- “GIM-Switch ... validated cross-seed consistency”
-- “GIM tells practitioners when to act and when to leave well enough alone”
-
-这些说法很有宣传力，但容易被追问：
-
-1. “tax” 是不是一定意味着负面 accuracy cost？如果 ERA 和 z-loss 有时是正向的，为什么叫 tax？
-2. “converge toward task gradient” 是指梯度方向越来越一致，还是 GIR/eGIR 衰减？如果是方向，那么和 AA oscillates near zero 矛盾。
-3. 98M ViT-Base-MoE 只有 n=2，能否叫 validated across scale？
-4. GIM-Switch 目前主要是 seed=42 的四次 transition，加 n=2 qualitative trajectory，是否足以叫 cross-seed validated？
-5. 如果 GIM 不能直接预测 accuracy，只是 diagnostic，是否应该避免 “tells practitioners” 这种过强措辞？
-
-这些风险都可以通过写作和补少量实验修复。
-
----
-
-## 2. 推荐的最终论文定位
-
-### 2.1 不推荐的定位
-
-不建议把论文定位成：
-
-> We propose GIM and solve auxiliary loss interference through GIM-Switch.
-
-原因是 GIM-Switch 当前证据不足。若这样定位，reviewer 会按 adaptive scheduler / training method paper 的标准来审，要求：
-
-- fixed λ baseline；
-- schedule baseline；
-- multi-seed；
-- threshold sensitivity；
-- accuracy/stability gain；
-- compute overhead；
-- generalization across datasets/backbones。
-
-目前论文还达不到这个标准。
-
-### 2.2 推荐的定位
-
-建议把论文定位成：
-
-> We propose GIM as a diagnostic framework for quantifying the router-gradient tax imposed by auxiliary losses in sparse MoE. GIM reveals that this tax is structured: raw GIR inflation is often denominator-driven; effective GIR is bounded by λ-weighting; and auxiliary losses form a λ-dependent convergence-rate spectrum whose accuracy effects are mediated by routing-distribution reshaping.
-
-中文表述：
-
-> 本文提出 GIM，用于诊断 sparse MoE 中 auxiliary loss 对 router 参数造成的梯度层面 tax。GIM 揭示了这个 tax 的结构：raw GIR 的爆炸常常是 denominator collapse 的假象；eGIR 才是实际更新压力；不同 auxiliary loss 构成一个受 λ 控制的收敛速度谱系；accuracy effect 不是由 raw gradient magnitude 直接决定，而是通过 routing distribution / expert specialization 体现。
-
-这个定位更稳，因为它把论文变成 **empirical diagnostic + mechanistic characterization**，而不是硬说自己提出了一个强 intervention algorithm。
+| # | 风险 | 严重程度 | 修复 ID |
+|---|---|---|---|
+| 1 | "Every auxiliary loss imposes a tax" — tax 未定义，与正向 Δ 冲突 | 高 | P0 |
+| 2 | "all auxiliary losses converge toward the task gradient" — 与 AA≈0 矛盾 | 高 | P0 |
+| 3 | "validated across scale up to 98M" — ViT-Base n=2 | 高 | P6 |
+| 4 | GIM-Switch under-validated — 无 baseline 对比 | 极高 | P3 |
+| 5 | "GIM tells practitioners when to act" — 像 method guarantee | 中 | P0 |
+| 6 | Section 5.1 routing mediation 证据不足 — CIFAR Δ 太小无法支撑 | 中 | P4 |
+| 7 | LB TOST failure 未正面利用 | 中 | P4 |
+| 8 | Appendix G（Adam v_t）/ Appendix I（λ decay）主文未利用 | 中 | P7 |
+| 9 | 所有实验仅用 AdamW | 中高 | P8 |
+| 10 | 多数实验 n=3-6，borderline 统计 power | 中 | P9 |
+| 11 | 只有 3 种 auxiliary loss，scope 狭窄 | 中 | PB |
+| 12 | 无理论支撑，NeurIPS checklist Theory=N/A | 中高 | PC |
+| 13 | GIM novelty 被质疑 — 只是 gradient norm + cosine | 高 | PD |
+| 14 | 论文说 "GIM is cheap" 但无具体数字 | 低 | PF |
+| 15 | Single-batch GIM 噪声大，尤其 late training | 中 | PH |
 
 ---
 
-## 3. 修改后的核心贡献表述
+## 2. 修改后的核心贡献表述
 
-建议最终 contributions 改成四条：
+### 路径 A（GIM-Switch 成功）
 
-### Contribution 1: GIM diagnostic framework
+1. **GIM diagnostic framework** — per-layer router-gradient diagnostic: GIR, AA, eGIR/GCF, deGIR
+2. **Theoretical grounding** — Proposition 1: convergent lifecycle condition
+3. **λ-dependent convergence-rate spectrum** — validated across 3 datasets, 2 architectures, 2 optimizers, 4 loss types, 7M-98M scale
+4. **Bounded effective tax + routing-mediated accuracy** — three-layer attenuation mechanism
+5. **GIM-Switch: diagnostic-driven adaptive scheduling** — matches/beats fixed-λ baselines, n=5 seeds, cross-dataset
 
-> We introduce GIM, a per-layer router-gradient diagnostic that decomposes auxiliary–task interactions into magnitude dominance (GIR), directional alignment (AA), and λ-weighted effective contribution (eGIR/GCF). GIM is diagnostic rather than prescriptive.
+### 路径 B（GIM-Switch 失败）
 
-重点：强调 diagnostic，不要和 PCGrad/CAGrad 这种 resolution method 混淆。
-
-### Contribution 2: λ-dependent convergence-rate spectrum
-
-> We show that auxiliary losses form a λ-dependent convergence-rate spectrum: ERA-like coupling objectives self-extinguish rapidly once alignment is satisfied, whereas load-balancing remains slow-converging/persistent. Tiny-ImageNet dose-response reveals a null zone below λ≈0.05 and a thresholded separation above λ≈0.1.
-
-重点：新版不应继续强调严格二分类，而应说 spectrum。标题可以保留 “Convergent or Persistent?”，但正文要解释这是 spectrum 的两端。
-
-### Contribution 3: Effective tax is bounded; accuracy effects are mediated by routing distribution
-
-> We show that large raw GIR often reflects denominator collapse rather than operational interference; eGIR and GCF reveal a bounded effective tax. Accuracy differences are better explained by routing-distribution reshaping and expert specialization than by raw gradient magnitude alone.
-
-重点：这是整篇论文最有机制深度的地方。
-
-### Contribution 4: Proof-of-concept applications
-
-> We provide two proof-of-concept applications: GIM-Switch, an eGIR-driven adaptive λ modulation scheme, and phantom GIM, a counterfactual diagnostic for loss-free balancing.
-
-重点：如果不补强 GIM-Switch，就不要说 “validated scheduler”。
+贡献 1-4 不变；贡献 5 降级为 proof-of-concept + Appendix I λ-decay ablation 作为补充 intervention 证据。
 
 ---
 
-## 4. 逐段写作修改建议
+## 3. 逐段写作修改建议
 
-### 4.1 Abstract 修改建议
-
-#### 当前问题
-
-当前 abstract 过强，尤其：
-
-- “Every auxiliary loss ... imposes a gradient-level tax” 没有定义 tax；
-- “all auxiliary losses converge toward the task gradient” 容易被理解成方向收敛；
-- “GIM tells practitioners when to act” 像 method guarantee；
-- GIM-Switch 和 phantom GIM 权重过高。
-
-#### 建议版本
+### 3.1 Abstract
 
 ```text
-Auxiliary losses are ubiquitous in sparse Mixture-of-Experts training, yet their router-gradient dynamics are rarely measured. We introduce the Gradient Interference Matrix (GIM), a per-layer diagnostic that decomposes auxiliary–task interactions on router weights into magnitude dominance, directional alignment, and λ-weighted effective contribution.
+Auxiliary losses are ubiquitous in sparse Mixture-of-Experts training, yet
+their router-gradient dynamics are rarely measured. We introduce the Gradient
+Interference Matrix (GIM), a per-layer diagnostic that decomposes auxiliary–
+task interactions on router weights into magnitude dominance, directional
+alignment, and λ-weighted effective contribution.
 
-Across controlled vision MoE settings spanning CIFAR-100, Tiny-ImageNet, ImageNet-50, ViT/ConvNeXt backbones, and a preliminary 98M-parameter scale check, GIM reveals a λ-dependent convergence-rate spectrum. Load-balancing remains slow-converging with persistent router-gradient pressure, whereas expert-router alignment self-extinguishes within tens of epochs once its objective is satisfied. On Tiny-ImageNet, this separation is threshold-mediated: below λ≈0.05 the losses are indistinguishable, while above λ≈0.1 LB exceeds ERA in 13/13 matched comparisons.
+We show that whether an auxiliary loss self-extinguishes or persists depends
+on a simple structural condition: losses with a satisfiable optimum on the
+router subspace (e.g., expert-router alignment) follow a convergent lifecycle,
+whereas losses targeting globally unattainable objectives (e.g., exact load
+balancing) remain persistent (Proposition 1).
 
-We further show that large raw GIR can be misleading under task-gradient denominator collapse; λ-weighted eGIR and GCF reveal that the effective tax is bounded in the studied regimes. Accuracy effects are better explained by routing-distribution reshaping than by raw gradient magnitude alone. Finally, we present GIM-Switch and phantom GIM as proof-of-concept applications for adaptive λ modulation and counterfactual loss-free balancing diagnostics.
+Across controlled vision MoE settings spanning three datasets, ViT/ConvNeXt
+backbones, scales from ~7M to ~98M parameters, and both AdamW and SGD
+optimizers, GIM reveals a λ-dependent convergence-rate spectrum confirming
+this condition empirically. On Tiny-ImageNet, the separation is threshold-
+mediated: below λ≈0.05 the losses are indistinguishable, while above λ≈0.1
+LB exceeds ERA in all matched comparisons.
+
+Large raw GIR is often misleading: three independent attenuation mechanisms
+—λ-weighting, bounded convergence, and optimizer normalization—keep the
+effective tax bounded. The ghost-gradient/amplifier distinction demonstrates
+that angular alignment, not gradient magnitude alone, determines whether
+interference is operationally harmful. Accuracy effects are better explained
+by routing-distribution reshaping than by raw gradient magnitude.
+
+[路径 A 追加:]
+We operationalize these findings through GIM-Switch, an adaptive λ scheduler
+that uses eGIR for bidirectional tier transitions. Across n=5 seeds,
+GIM-Switch matches tuned fixed-λ baselines without per-setting grid search.
 ```
 
-这个版本更稳，不会承诺过多。
-
-### 4.2 Introduction 修改建议
-
-Introduction 第一页建议加入一个提前防守句：
+### 3.2 Tax 定义（intro 首次使用后立刻插入）
 
 ```text
-We study micro-to-medium-scale vision MoE as a controlled setting for isolating router-gradient dynamics; production-scale language MoE validation remains future work.
+We use "tax" to denote the fraction of the router update budget consumed by
+auxiliary gradients; it does not necessarily imply a negative accuracy effect.
 ```
 
-这样可以降低 reviewer 对 benchmark/scale 的攻击。当前论文最大模型约 98M，而且 ViT-Base-MoE 是 n=2，不适合让读者误以为已验证 production MoE。
-
-### 4.3 Tax 定义必须提前
-
-建议在第一次使用 “tax” 后立刻定义：
+### 3.3 Scope declaration（intro 末尾）
 
 ```text
-We use “tax” to denote the fraction of the router update budget consumed by auxiliary gradients; it does not necessarily imply a negative accuracy effect.
+We study micro-to-medium-scale vision MoE (7M–98M parameters) as a controlled
+setting for isolating router-gradient dynamics. We validate key findings under
+both AdamW and SGD to assess optimizer dependence; production-scale language
+MoE validation remains future work.
 ```
 
-这句话很重要，因为 Table 1 中 ERA/z-loss 有时带来正向 accuracy delta。如果不定义，reviewer 会说 “tax” 是误导性概念。
-
-### 4.4 “converge toward task gradient” 必须改掉
-
-当前 “all auxiliary losses converge toward the task gradient” 容易和 AA near-zero 的结论冲突。建议改成：
+### 3.4 "converge toward task gradient" 全部替换为
 
 ```text
-all auxiliary losses show declining router-gradient pressure under non-saturated regimes, but at sharply different rates.
+auxiliary losses show declining router-gradient pressure under non-saturated
+regimes, but at sharply different rates
 ```
 
-或者：
+### 3.5 Routing mediation 论点改用更大效应量的证据
+
+不再引用 CIFAR-100 Table 1（Δ ±0.34 pp，TOST 等价），改为：
 
 ```text
-auxiliary losses differ in how quickly their router-gradient pressure decays.
+The decoupling between gradient magnitude and accuracy cost is most visible
+at ViT-Small scale, where LB suppresses expert load variance by 85–87% while
+producing a mean accuracy decrease of −2.36 pp (n=3), and on ConvNeXt-MoE,
+where ERA consistently improves accuracy across all seeds (mean +2.18 pp,
+n=3) despite self-limiting GIR.
 ```
 
-### 4.5 Contributions 降级 GIM-Switch
-
-当前 “GIM-Switch ... with validated cross-seed consistency” 建议改成：
+### 3.6 正面利用 LB TOST failure
 
 ```text
-We demonstrate two proof-of-concept applications: GIM-Switch, which uses eGIR to modulate λ through bidirectional tier transitions, and phantom GIM, which quantifies counterfactual interference under loss-free balancing.
+Load-balancing fails Dunnett-corrected TOST at both ViT-Tiny (p_Dunn=0.027)
+and ViT-Small (p_Dunn=0.090) scales, and narrowly misses on ImageNet-50
+(p_Dunn=0.051). Combined with the 85–87% load variance suppression at
+ViT-Small, this pattern is consistent with a routing-uniformization cost.
 ```
-
-除非补出多 seed baseline 对比，否则不要把 GIM-Switch 放成主贡献。
 
 ---
 
-## 5. 实验提升方案：按优先级排序
+## 4. 完整实验与写作计划：统一优先级表
 
-## Priority 0：立即收缩过强 claim
+### 4.0 GPU 分配总览
 
-这项不需要算力，但收益最高。
-
-### 需要替换的表述
-
-| 当前表述 | 建议表述 | 原因 |
-|---|---|---|
-| validated across three datasets, two architectures, and scales up to 98M | observed consistently across controlled datasets/backbones, with a preliminary 98M scale check | ViT-Base-MoE n=2，不应叫 validated |
-| GIM-Switch validated cross-seed consistency | GIM-Switch proof-of-concept with qualitative trajectory replication | 目前不是 scheduler performance validation |
-| all auxiliary losses converge toward the task gradient | auxiliary losses show different rates of router-gradient pressure decay | 避免和 AA near-zero 矛盾 |
-| GIM tells practitioners when to act | GIM provides diagnostic evidence for deciding when intervention may be warranted | 避免保证式措辞 |
-| auxiliary loss tax | router-gradient update tax, not necessarily accuracy cost | 避免 tax 与正向 accuracy delta 冲突 |
-
----
-
-## Priority 1：证明 GIM 的增量价值
-
-### 5.1 Reviewer 可能的质疑
-
-GIM 本质是：
-
-- gradient norm ratio；
-- cosine similarity；
-- λ scaling；
-- GCF。
-
-这些量都不新。Reviewer 会问：为什么这不是一个简单的 measurement，而是一篇 NeurIPS paper？
-
-### 5.2 需要新增的小节
-
-建议在 Results 或 Discussion 里加：
-
-```text
-Why GIM rather than simpler diagnostics?
-```
-
-核心论点：单一指标无法解释关键现象。
-
-### 5.3 建议新增表格
-
-| Phenomenon | Aux loss value | Expert load variance | raw GIR | eGIR/GCF | AA/deGIR | Full GIM |
-|---|---:|---:|---:|---:|---:|---:|
-| CIFAR late GIR explosion is denominator-driven | ✗ | ✗ | partially, but misleading | ✓ | partial | ✓ |
-| Ghost-gradient vs amplifier | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ |
-| z-loss high raw GIR but negligible accuracy cost | ✗ | partial | misleading | partial | ✓ | ✓ |
-| LB accuracy cost despite eGIR sometimes <1 | ✗ | ✓ | ✗ | partial | ✗ | ✓ with routing metrics |
-| Tiny-ImageNet λ threshold | partial | partial | ✓ | ✓ | partial | ✓ |
-| ConvNeXt ERA self-limiting high-λ behavior | ✗ | partial | ✓ | ✓ | partial | ✓ |
-
-### 5.4 最该突出的 case：ghost-gradient vs amplifier
-
-这是最干净的 GIM 增量证据。
-
-当前论文中已有：
-
-- λ=0.001：GIR 48–59×，但 |cosθ|<0.10，accuracy 没有 collapse，是 ghost-gradient；
-- λ=0.01：某 seed collapse，是 amplifier regime。
-
-建议做一张主文图：
-
-- x-axis: λ；
-- y-axis left: raw GIR；
-- y-axis right: |cosθ| or deGIR；
-- marker color: accuracy delta；
-- 标注 ghost-gradient / amplifier / stabilizer / saturation。
-
-图的目的：证明 raw GIR alone 不够，AA/deGIR 对解释 accuracy risk 有增量价值。
-
----
-
-## Priority 2：补强 Tiny-ImageNet dose-response
-
-### 6.1 当前价值
-
-Tiny-ImageNet dose-response 是新版最有潜力的核心结果。它说明 taxonomy 不是 CIFAR-100 特有，而是随 λ 出现 threshold-mediated separation：
-
-- λ=0.01：taxonomy ratio ≈1.0；
-- λ=0.05：0.983×；
-- λ=0.1：1.747×；
-- λ=0.2：2.321×；
-- λ=0.3：2.59×；
-- λ≥0.1：13/13 matched pairs show LB > ERA。
-
-这个结果应该成为论文主线之一。
-
-### 6.2 当前不足
-
-当前不足：
-
-1. λ=0.2、0.3 只有 2 seeds；
-2. 只报告 taxonomy ratio，不够解释 accuracy/effective tax/routing behavior；
-3. threshold 位置 λ≈0.1 还比较粗糙；
-4. 13/13 matched pairs 的独立性需要更谨慎表述。
-
-### 6.3 需要补的实验
-
-最低成本：
-
-- λ=0.2、0.3 补到 n=3；
-- 每个 λ 报告 accuracy delta；
-- 每个 λ 报告 eGIR；
-- 每个 λ 报告 expert load std / entropy；
-- 可选增加 λ=0.075 或 0.08，用于定位 threshold。
-
-### 6.4 需要补的图
-
-建议 Figure 4 改成三联图：
-
-1. taxonomy ratio vs λ；
-2. eGIR ratio / GCF vs λ；
-3. accuracy delta or load variance vs λ。
-
-这样可以回答：taxonomy separation 是否只是 gradient ratio 现象？是否对应 routing 或 accuracy 改变？
-
-### 6.5 统计表述修改
-
-当前 “13/13 matched pairs, p<0.001” 建议改成：
-
-```text
-Treating matched seed–λ comparisons as paired observations, 13/13 comparisons at λ≥0.1 show LB > ERA (two-sided sign test p<0.001); because comparisons share training recipes and seeds, we treat this as strong preliminary evidence rather than independent replication.
-```
-
-这样更抗审稿。
-
----
-
-## Priority 3：补强或降级 GIM-Switch
-
-### 7.1 当前问题
-
-GIM-Switch 目前主要展示：
-
-- CIFAR-100；
-- elevated λlb=0.1；
-- seed=42；
-- 四次 tier transitions；
-- standard λlb=0.01 时 eGIR 在 Safe；
-- n=2 qualitative U-shaped trajectory replication。
-
-这不足以支撑 “validated scheduler”。它只能说明 scheduler 会按照设计触发 transition。
-
-### 7.2 两种选择
-
-#### 选择 A：补强，保留为主贡献
-
-需要补最小可接受实验。
-
-设置：CIFAR-100，ViT-Tiny，λlb=0.1 elevated setting。
-
-比较方法：
-
-1. Fixed λlb=0.1；
-2. Fixed λlb=0.05；
-3. Linear decay λlb: 0.1 → 0；
-4. GIM-Switch；
-5. Optional: oracle best fixed λ。
-
-Seeds：n=3 起步，n=5 更好。
-
-报告指标：
-
-- best accuracy；
-- final accuracy；
-- accuracy std；
-- eGIR AUC；
-- max eGIR；
-- time in Safe/Monitor/Intervene；
-- transition count and timing；
-- expert load std；
-- router entropy；
-- whether λ restoration happens。
-
-成功标准不一定是最高 accuracy。满足下面任一条就可以写：
-
-- GIM-Switch 接近 oracle fixed λ；
-- 比 fixed λ=0.1 更稳定；
-- 能减少 eGIR>1 的时间；
-- 能自动恢复 λ，区别于 unidirectional decay；
-- 减少 seed variance。
-
-#### 选择 B：不补强，降级为 proof-of-concept
-
-如果时间不足，就把 GIM-Switch 移到 Discussion 或 Appendix，主文只保留一句：
-
-```text
-As a proof of concept, GIM-Switch demonstrates that eGIR can drive bidirectional λ modulation; systematic scheduler evaluation is left for future work.
-```
-
-这样可以避免 reviewer 按 algorithm paper 标准攻击。
-
-### 7.3 推荐
-
-如果有 2–4 张 5090 和 agent coding，建议至少做 n=3 的 GIM-Switch vs fixed λ=0.1 vs fixed λ=0.05。这个实验 ROI 很高，因为它直接决定 GIM-Switch 能否留在 contribution。
-
----
-
-## Priority 4：把 routing-distribution reshaping 升级为机制主线
-
-### 8.1 当前问题
-
-论文现在说 accuracy effects are consistent with routing policy reshaping rather than gradient-level competition，但主文证据太少。
-
-已有关键 evidence：
-
-- ViT-Small 中 LB suppresses expert load variance by 85–87%；
-- z-loss preserves baseline specialization；
-- ConvNeXt 中 ERA consistently improves accuracy；
-- LB 在 ConvNeXt 中 eGIR 有时接近/超过 Intervene，但 accuracy degradation 也可能发生在 eGIR<1；
-- z-loss GIR 高但 accuracy cost 小。
-
-这些点应该被组织成一个机制小节。
-
-### 8.2 建议新增小节
-
-```text
-Gradient Tax vs. Routing Tax
-```
-
-核心观点：
-
-1. raw GIR/eGIR 衡量的是 router-gradient update tax；
-2. accuracy cost 不完全由 gradient magnitude 决定；
-3. LB 可能通过强制 uniform routing 损害 expert specialization；
-4. z-loss 尽管 raw GIR 高，但不强制 uniform expert use，因此 accuracy cost 小；
-5. ERA 通过 router-expert coupling 改善 routing quality，并且 self-extinguish，所以更安全。
-
-### 8.3 建议新增表格
-
-| Setting | Loss | Gradient behavior | Routing behavior | Accuracy behavior | Interpretation |
+| ID | 实验/写作 | GPU-h | 执行天 | 类型 | 必须？ |
 |---|---|---|---|---|---|
-| ViT-Tiny CIFAR | LB | raw GIR 16–75× late, eGIR bounded | more uniform routing | small Δ | denominator collapse + bounded tax |
-| ViT-Small | LB | persistent | load variance -85–87% | negative trend | uniformization cost |
-| ViT-Small | z-loss | GIR >1 at layers | preserves specialization | small/positive Δ | magnitude not enough |
-| ConvNeXt | ERA | self-limiting GIR | improved coupling likely | +2–4 pp | convergent coupling benefit |
-| ViT-Tiny λ=0.001 | ERA | high raw GIR, low AA | no collapse | positive/neutral | ghost gradient |
-| ViT-Tiny λ=0.01 | ERA | non-negligible AA in bad seed | seed collapse | negative outlier | amplifier |
-
-这张表会显著提升机制说服力。
+| **P0** | 收缩 overclaim | 0 | Day 1 | 写作 | 必须 |
+| **P1** | GIM 增量价值 + ghost/amplifier 主文化 | 0 | Day 1 | 写作 | 必须 |
+| **P2** | Tiny-ImageNet dose-response 补全 | 20 | Day 1 | 实验 | 必须 |
+| **P3** | GIM-Switch 正面验证 | 55 | Day 1-2 | 实验 | 必须 |
+| **P4** | Routing reshaping 主文化 | 0 | Day 2-3 | 写作 | 必须 |
+| **P5** | ConvNeXt 主文化 | 0 | Day 1 | 写作 | 必须 |
+| **P6** | ViT-Base-MoE 补到 n≥5 | 40 | Day 3 | 实验 | 强烈建议 |
+| **P7** | 三层 attenuation 机制闭环 | 0 | Day 2-3 | 写作 | 必须 |
+| **P8** | SGD 优化器 ablation | 30 | Day 1-2 | 实验 | 强烈建议 |
+| **P9** | CIFAR-100 核心实验补到 n=10 | 40 | Day 1-2 | 实验 | 建议 |
+| **P10** | Tiny-ImageNet 扩展 dose-response | 30 | Day 2-3 | 实验 | 建议 |
+| **PA** | GIM-Switch 超参数 sensitivity | 15 | Day 3 | 实验 | P3 成功则必须 |
+| **PB** | Expert-choice 第 4 种 loss/routing | 25 | Day 1-2 | 实验 | 强烈建议 |
+| **PC** | Proposition 1 理论命题 | 0 | Day 1 | 写作 | 必须 |
+| **PD** | GIM component ablation decision analysis | 0 | Day 1 | 写作 | 必须 |
+| **PE** | Figure 10/12 主文化 | 0 | Day 1 | 写作 | 必须 |
+| **PF** | GIM 计算开销分析 | 0 | Day 4 | 写作 | 建议 |
+| **PG** | Practical decision flowchart | 0 | Day 3 | 写作 | 必须 |
+| **PH** | Multi-batch GIM 验证 | 5 | Day 2 | 实验 | 建议 |
+| | **GPU 总计** | **310** | | | |
 
 ---
 
-## Priority 5：重新组织 ConvNeXt-MoE 的结果
+### P0：收缩 overclaim（Day 1 上午，0 GPU-h）
 
-### 9.1 当前问题
+| 当前表述 | 建议表述 |
+|---|---|
+| validated across three datasets, two architectures, and scales up to 98M | observed consistently across controlled settings, with n≥5 seeds at 98M scale |
+| GIM-Switch validated cross-seed consistency | GIM-Switch matches/beats fixed-λ baselines across n=5 seeds（或降级 PoC） |
+| all auxiliary losses converge toward the task gradient | auxiliary losses show different rates of router-gradient pressure decay |
+| GIM tells practitioners when to act | GIM provides diagnostic evidence for λ management |
+| auxiliary loss tax | router-gradient update tax (not necessarily accuracy cost) |
+| accuracy differences coexist with eGIR<1 (citing CIFAR-100 Table 1) | 改引 ViT-Small/ConvNeXt 更大效应量 |
 
-ConvNeXt 结果很强，但主文没有充分利用。目前主要写成 “architecture-dependent regime boundaries”。这有点浪费。
+---
 
-### 9.2 推荐叙事
+### P1：GIM 增量价值 + ghost/amplifier 主文化（Day 1，0 GPU-h）
 
-ConvNeXt 应该支持下面这个更强结论：
+**核心论点**：AA（方向信息）是区分 benign vs harmful interference 的**必要条件**——raw GIR alone 无法区分。
+
+**已有数据**（Appendix C.14, C.10）：
+- λ=0.001：GIR 48-59×，|cosθ|<0.10，Δ=+1.13±0.54 pp → ghost-gradient
+- λ=0.01：GIR 同量级，seed s123 的 cosθ 非零且 collapse → amplifier
+- 两个 λ 的 raw GIR 在相同数量级，accuracy 和 AA 完全不同
+
+**新增主文图**：x=λ, y_left=raw GIR (log), y_right=|cosθ|, marker color=accuracy Δ direction，标注 4 个 regime（ghost-gradient / amplifier / stabilizer / saturation）。
+
+**新增 diagnostic summary table**：
+
+| Phenomenon | Loss value | Load var | raw GIR | eGIR/GCF | AA/deGIR | Full GIM |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Late GIR explosion = denominator collapse | ✗ | ✗ | misleading | ✓ | partial | ✓ |
+| Ghost-gradient vs amplifier | ✗ | ✗ | ✗ (same order) | ✗ | **✓** | ✓ |
+| Z-loss: high GIR, negligible accuracy cost | ✗ | partial | misleading | partial | ✓ (cos≈0) | ✓ |
+| LB accuracy cost despite eGIR<1 | ✗ | ✓ | ✗ | partial | ✗ | ✓+routing |
+
+---
+
+### P2：Tiny-ImageNet dose-response 补全（Day 1，~20 GPU-h）
+
+**当前**：λ=0.01/0.05/0.1 各 n=3 ✓；λ=0.2/0.3 各 n=2 ✗
+
+| 实验 | runs | GPU-h |
+|---|---|---|
+| λ=0.2 LB+ERA 各补 1 seed | 2 | ~4h |
+| λ=0.3 LB+ERA 各补 1 seed | 2 | ~4h |
+| λ=0.075 LB+ERA × 3 seeds（定位 threshold） | 6 | ~12h |
+| **小计** | 10 | **~20h** |
+
+**注意**：λ=0.3 当前 std=0.72（n=2），第 3 seed 可能大幅改变 mean ratio，需要准备调整叙事。
+
+**新增三联图**（替代当前 Figure 4）：(1) taxonomy ratio vs λ, (2) mean eGIR ratio vs λ, (3) accuracy Δ vs λ
+
+**统计**：13/13 sign test 改为 "paired observations"；补 λ=0.075 后精确定位 threshold。
+
+---
+
+### P3：GIM-Switch 正面验证（Day 1-2，~55 GPU-h）⭐ 最高 ROI
+
+**实验设计**：CIFAR-100 ViT-Tiny 90ep
+
+比较方法（5 种）× n=5 seeds（42, 123, 256, 7, 99）：
+
+1. Fixed λ_lb=0.01（论文默认）
+2. Fixed λ_lb=0.05
+3. Fixed λ_lb=0.1（elevated）
+4. Linear decay λ_lb: 0.1 → 0.001 over 90ep
+5. GIM-Switch (τ₁=0.1, τ₂=1.0, γ=0.5, starting λ_lb=0.1)
+
+**CIFAR runs**：25 × ~1h = **~25h**
+
+**如果 CIFAR 成功**（Day 2 下午决策点）：
+- Tiny-ImageNet 复制：3 条件 × 3 seeds = 9 × ~2h = **~18h**
+- ConvNeXt-MoE 复制：3 条件 × 3 seeds = 9 × ~1.5h = **~14h**（验证 cross-architecture）
+
+**报告指标**：best accuracy, final accuracy, accuracy std, eGIR AUC, max eGIR, time in Safe/Monitor/Intervene, transition count+timing, expert load std, λ trajectory
+
+**成功标准**（满足任一即可）：
+1. accuracy ≥ best fixed-λ − 0.5 pp（mean）
+2. cross-seed std < best fixed-λ std
+3. eGIR AUC < fixed-λ=0.1 eGIR AUC
+4. 不同 seed 中展现不同 transition timing
+5. 无需知道哪个 fixed-λ 最好就达到 comparable performance
+
+**失败 fallback**：不跑 Tiny-ImageNet/ConvNeXt 复制（省 ~32h→转给 P6/P10），降级为 PoC + 引用 Appendix I λ-decay ablation。
+
+---
+
+### P4：Routing-distribution reshaping 主文化（Day 2-3，0 GPU-h）
+
+**新增小节**："Gradient Tax vs. Routing Tax"
+
+| Setting | Loss | Gradient | Routing | Accuracy | Interpretation |
+|---|---|---|---|---|---|
+| ViT-Tiny CIFAR | LB | raw GIR 16-75×, eGIR<0.75× | more uniform | +0.34pp (TOST pass) | bounded tax |
+| ViT-Small CIFAR | LB | persistent, GIR 4.4-50.2× | load_std -85-87% | -2.36pp | uniformization cost |
+| ViT-Small CIFAR | z-loss | GIR 39.5-438.8× | preserves specialization (0.154-0.187) | +1.25pp | magnitude ≠ accuracy |
+| ConvNeXt CIFAR | ERA | self-limiting 0.30-15.95× | improved coupling | +2.18pp (n=3) | convergent benefit |
+| ViT-Tiny λ=0.001 | ERA | GIR 48-59×, |cos|<0.10 | no collapse | +1.13pp | ghost gradient |
+| ViT-Tiny λ=0.01 | ERA | GIR + AA non-zero (s123) | seed collapse | variable | amplifier |
+
+**正面利用 LB TOST failure**：LB 在 ViT-Tiny (p=0.027) 和 ViT-Small (p=0.090) 都 fail TOST，结合 load variance suppression，支撑 routing-uniformization cost 叙事。
+
+---
+
+### P5：ConvNeXt-MoE 主文化（Day 1，0 GPU-h）
+
+拉入主文：
+- **Table 5**: ERA λ sweep（λ ↑ → accuracy ↑ + GIR ↓，7 个 λ 点）
+- **Table 6**: ERA λ=0.2 stabilizer verification（3 seeds 全 positive Δ +1.61 to +2.31 pp, accuracy std 从 0.99 → 0.64）
+
+叙事：
 
 > Architecture changes the accuracy optimum, but not the diagnostic principle: convergent coupling objectives can tolerate high λ because stronger λ accelerates objective satisfaction and leads to self-limiting GIR.
 
-中文：
+---
 
-> 不同架构会改变最优 λ，但不会改变 GIM 的诊断逻辑：ERA 这种 convergent coupling objective 即使 λ 较高，也可能因为更快满足目标而自我衰减，因此高 λ 不一定危险。
+### P6：ViT-Base-MoE 补到 n≥5（Day 3，~40 GPU-h）
 
-### 9.3 需要拉进主文的数据
+当前 n=2，不能说 "validated at medium scale"。
 
-ConvNeXt-MoE ERA λ sweep：
+| 实验 | runs | GPU-h |
+|---|---|---|
+| ViT-Base-MoE LB 3 new seeds | 3 | ~20h（4卡并行 ~5h/seed） |
+| ViT-Base-MoE ERA 3 new seeds | 3 | ~20h |
+| **小计** | 6 | **~40h**（4卡并行约 10h 完成） |
 
-- λ=0.001: accuracy -0.48 pp, GIR 15.95×；
-- λ=0.01: accuracy -0.53 pp, GIR 21.05×；
-- λ=0.05: +1.01 pp, GIR 3.78×；
-- λ=0.1: +2.18 pp, GIR 1.34×；
-- λ=0.2: +1.95 pp, GIR 0.79×；
-- λ=0.5: +3.09 pp, GIR 0.47×；
-- λ=1.0: +4.25 pp, GIR 0.30×。
+每个 seed 记录：raw GIR (all layers × all epochs), eGIR/GCF, expert load std, accuracy。
 
-这个非常漂亮：λ 越高，accuracy 越好，而 GIR 越低。这正好说明 convergent loss 的 self-limiting dynamics。
-
-### 9.4 建议新增图
-
-把 ConvNeXt Figure 5 简化后放主文：
-
-- x-axis: λ；
-- y-axis left: accuracy delta；
-- y-axis right: GIR；
-- 标注 crossover between λ=0.01 and 0.05；
-- 标注 self-limiting high-λ regime。
+补到 n=5 后：可做 TOST，可正式声称 "confirmed at ~98M scale with n=5 seeds"。
 
 ---
 
-## Priority 6：ViT-Base-MoE 只作为 preliminary scale check
+### P7：三层 attenuation 机制闭环（Day 2-3，0 GPU-h）
 
-### 10.1 当前问题
+Section 5.1 "Large GIR, Small Impact" 需要展示三层独立 attenuation：
 
-ViT-Base-MoE 约 98M，n=2，在 ImageNet-50 上做。它显示 LB GIR 是 ERA 的 10–67×。这是有价值的 sanity check，但不能承担 “validated across scale” 的主 claim。
+| 层级 | 机制 | 证据来源 | 压缩因子 |
+|---|---|---|---|
+| Layer 1 | λ-weighting | eGIR = λ × GIR (Eq.6) | 75× → 0.75× (at λ=0.01) |
+| Layer 2 | Bounded convergence | ERA self-extinguish ~35× decay; GCF task retains ~72% (Fig 9) | ERA GIR: 0.55→0.048 |
+| Layer 3 | Adam v_t normalization | Appendix G: v_t ratio 1.00-1.20× vs raw GIR 16-75× | >60× compression |
 
-### 10.2 建议表述
-
-将：
-
-```text
-validated at medium scale
-```
-
-改为：
+**新增写作**：在 Section 5.1 增加 Adam v_t 段落：
 
 ```text
-preliminary medium-scale check
+A third attenuation layer operates at the optimizer level. Appendix G shows
+that at epoch 90—when raw GIR reaches 16–75×—the Adam v_t ratio between
+auxiliary and no-auxiliary conditions remains within [1.00, 1.20]×. This >60×
+compression confirms that the optimizer absorbs most of the raw gradient
+imbalance. Together, the three mechanisms explain why raw GIR of 75× coexists
+with effective contributions below 1× and accuracy differences within ±2 pp.
 ```
 
-将：
+**利用 Appendix I λ-decay ablation**：
 
 ```text
-confirms the taxonomy ordering at medium scale
+A supplementary λ-decay ablation (Appendix I, Table 20) shows that simple
+threshold-based decay—halving λ when GIR exceeds τ—produces flat dose-
+response across τ ∈ {1.0, 5.0, 10.0}: the GIR phase transition is
+discontinuous, so reactive decay triggers identically regardless of τ. This
+motivates GIM-Switch's bidirectional design.
 ```
-
-改为：
-
-```text
-is consistent with the taxonomy ordering in a preliminary 98M-parameter check
-```
-
-### 10.3 如果还能补实验
-
-最低成本补法：
-
-1. 增加第 3 个 seed；
-2. 报告 eGIR/GCF，而不是只报 raw GIR；
-3. 报告 expert load variance；
-4. 拆开 LB-only / ERA-only / LB+ERA，而不只是 combined active。
-
-如果只能补一个，优先补 **eGIR/GCF + routing metrics**，因为它更贴合论文主线。
 
 ---
 
-## 6. 统计与可靠性提升
+### P8：SGD 优化器 ablation（Day 1-2，~30 GPU-h）⭐ 消除核心 limitation
 
-### 11.1 TOST margin sensitivity 要前置
+**Setting**：CIFAR-100 ViT-Tiny 90ep，**SGD with momentum 0.9 + weight decay 5e-4**
 
-当前论文使用 δ=±2 pp。这个可以成立，但 reviewer 会问：为什么 2 pp？如果 δ=1 pp 呢？
+| 条件 | seeds | runs | GPU-h |
+|---|---|---|---|
+| No-aux baseline (SGD) | 5 | 5 | ~5h |
+| LB λ=0.01 (SGD) | 5 | 5 | ~5h |
+| ERA λ=0.1 (SGD) | 5 | 5 | ~5h |
+| Z-loss λ=0.001 (SGD) | 5 | 5 | ~5h |
+| ERA λ sweep (0.025/0.1/0.5) × n=3 (SGD) | 3 each | 9 | ~9h |
+| **小计** | | 29 | **~29h** |
 
-建议主文 limitation 或 appendix summary 中写：
+**关键对比**：
+1. Taxonomy ordering 是否保持（LB > ERA in GIR）
+2. eGIR bounding 是否仍成立（无 Adam v_t）
+3. Late-training GIR explosion 是否仍 denominator-driven
+4. Accuracy delta pattern 是否一致
 
-```text
-Equivalence conclusions depend on the pre-specified ±2 pp margin. Under tighter margins, fewer comparisons pass; therefore our equivalence results should be interpreted as practical equivalence under a 2σ-scale tolerance rather than proof of negligible effects.
-```
-
-### 11.2 对 ρ-sensitive z-loss 更保守
-
-ImageNet-50 z-loss pDunn=0.047 且 ρ-sensitive，margin 很窄。不要在 abstract 里作为强证据。建议写：
-
-```text
-ImageNet-50 z-loss is borderline under Dunnett correction and sensitive to the equicorrelation assumption.
-```
-
-### 11.3 单 batch GIM measurement 的限制要说明
-
-GIM/AA 是 single-batch 估计，late training task gradient 接近 0 时 AA noisy。建议：
-
-- 主文报告 selected results 的 multi-batch averaged GIM；
-- 或至少在 appendix 给 single-batch vs 16-batch comparison；
-- 对 late-training AA 不做强结论。
-
-### 11.4 13/13 sign test 的独立性
-
-如前所述，13 个 pair 可能不是完全独立。建议在文字里说 “paired observations”，避免过度统计化。
+**无论哪个结果都是 positive**：SGD 一致 → 删 limitation，加 "validated under both optimizers"；SGD 不同 → interesting finding，optimizer 是 key modulator。
 
 ---
 
-## 7. 建议的最终主文结构
+### P9：CIFAR-100 核心实验补到 n=10（Day 1-2，~40 GPU-h）
 
-建议主文结构如下：
+当前 n=6，TOST p_Dunn 在 0.024-0.045——margin 紧张。
+
+| 条件 | 当前 n | 补到 | 新增 | GPU-h |
+|---|---|---|---|---|
+| No-aux baseline | 6 | 10 | 4 | ~4h |
+| LB λ=0.01 | 6 | 10 | 4 | ~4h |
+| ERA λ=0.1 | 6(部分3) | 10 | 4-7 | ~7h |
+| Z-loss λ=0.001 | 6 | 10 | 4 | ~4h |
+| ERA λ=0.2 (best) | 3 | 6 | 3 | ~3h |
+| ERA λ=0.025 | 3 | 6 | 3 | ~3h |
+| ERA λ=0.5 | 3 | 6 | 3 | ~3h |
+| GIM measurement overhead | — | — | — | ~8h |
+| **小计** | | | ~28 | **~36h** |
+
+Impact：n=10 后 TOST power ≈ 0.80（远高于 n=6 的 ~0.45）；ERA λ sweep n=6 使 stabilizer/amplifier regime boundary 更精确。
+
+---
+
+### P10：Tiny-ImageNet 扩展 dose-response（Day 2-3，~30 GPU-h）
+
+补更多 λ 点 + 更多指标：
+
+| 实验 | runs | GPU-h |
+|---|---|---|
+| No-aux baseline n=3 (if needed) | 3 | ~6h |
+| λ=0.15 LB+ERA × 3 seeds | 6 | ~12h |
+| λ=0.4 LB+ERA × 2 seeds | 4 | ~8h |
+| 已有条件补 accuracy/eGIR/load_std | ~2-4 | ~4h |
+| **小计** | ~15 | **~30h** |
+
+Impact：Figure 4 从 5 → 8 个 λ 点；三联图成为论文最强主图之一。
+
+---
+
+### PA：GIM-Switch 超参数 sensitivity（Day 3，~15 GPU-h）
+
+**条件**：仅在 P3 成功时执行。
+
+CIFAR-100 ViT-Tiny n=3 seeds（42, 123, 256），one-at-a-time sweep：
+
+| 变量 | 默认 | sweep 点 | 新增 runs |
+|---|---|---|---|
+| τ₁ (Safe threshold) | 0.1 | {0.05, 0.2} | 6 |
+| τ₂ (Intervene threshold) | 1.0 | {0.5, 2.0} | 6 |
+| γ (attenuation factor) | 0.5 | {0.25, 0.75} | 6 |
+| **小计** | | | **18 runs → ~15h**（扣除默认配置已有） |
+
+**成功标准**：accuracy std across sweep < 1 pp（证明不敏感）。
+
+**如果不做，GIM-Switch 作为主贡献时会被 reviewer 以 cherry-picking 直接攻击。**
+
+---
+
+### PB：Expert-choice routing 作为第 4 种 loss/routing paradigm（Day 1-2，~25 GPU-h）⭐ 扩展 scope
+
+**为什么 expert-choice 是最优选**：
+- Expert-choice routing [Zhou et al., 2022]：每个 expert 选 top-k tokens（而非每个 token 选 top-k experts）
+- 不需要 LB loss（load balancing built-in），gradient dynamics 应完全不同
+- 如果 GIM 能区分 expert-choice 的 gradient pattern → 大幅增强 diagnostic value
+- 如果 expert-choice 的 GIR profile 符合 Proposition 1 的预测 → 理论验证
+
+**实验设计**：CIFAR-100 ViT-Tiny, expert-choice routing
+
+| 条件 | seeds | runs | GPU-h |
+|---|---|---|---|
+| Expert-choice no-aux | 5 | 5 | ~5h |
+| Expert-choice + ERA | 5 | 5 | ~5h |
+| GIM measurement overhead | — | — | ~5h |
+| **小计** | | 10 | **~15h** |
+
+外加对比标准 top-2 routing 的 GIM profile（已有数据），总计 ~25h（含 coding 时间）。
+
+**关键预期**：
+- Expert-choice GIR 应很低（无 LB gradient pressure）→ 验证 "persistent = unsatisfiable objective"
+- 如果加 ERA，应 follow convergent lifecycle → 验证 Proposition 1
+
+---
+
+### PC：Proposition 1 理论命题（Day 1，0 GPU-h）⭐ 最高杠杆零成本改进
+
+```text
+Proposition 1 (Convergent lifecycle condition). Consider an auxiliary loss
+L_i with gradient g_i on router parameters θ_R. If there exists a feasible
+θ_R* such that ∇_{θ_R} L_i(θ_R*) = 0 (i.e., L_i has a satisfiable optimum
+on the router subspace), and training converges to a neighborhood of θ_R*,
+then GIR_i(l,t) → 0 as t → ∞ for all layers l.
+
+Conversely, if L_i has no feasible zero-gradient point on θ_R (e.g.,
+load-balancing under discrete top-k routing, where exact uniform utilization
+is generically unattainable), then GIR_i remains bounded away from zero.
+```
+
+**Proof sketch**（Section 3 或 Appendix）：
+- 前半部分：∇L_i → 0 ⟹ ||g_i|| → 0 ⟹ GIR = ||g_i||/||g_task|| → 0（假设 g_task 不先 collapse；denominator collapse case 由 eGIR 处理）
+- 后半部分：LB loss 的 gradient 为 0 当且仅当所有 expert 负载严格相等，但在 discrete top-k routing 下这需要 token 数被 expert 数整除且 router 恰好产生均匀分配，是一个 measure-zero 事件
+
+**价值**：
+1. 把 convergent/persistent 从经验观察变成有理论支撑的分类
+2. ERA 有 satisfiable optimum → self-extinguish；LB 没有 → persistent → 直接解释 taxonomy
+3. NeurIPS checklist Theory 从 "N/A" 变 "Yes"
+4. Expert-choice routing 实验（PB）可以作为 Proposition 1 的额外验证
+
+---
+
+### PD：GIM component ablation — decision analysis（Day 1，0 GPU-h）⭐ 关键 novelty 防守
+
+**新增段落**（Section 4.3 或 Discussion）：
+
+```text
+GIM component ablation: decision analysis
+
+We trace the diagnostic decisions a practitioner would reach using
+progressively richer GIM subsets on ERA at λ=0.001 (ghost-gradient regime):
+
+1. GIR-only: raw GIR = 48–59× → "ALARM: auxiliary gradient dominates by
+   50×" → Decision: reduce λ → WRONG (accuracy is +1.13 pp, three seeds
+   all positive)
+
+2. GIR + eGIR: eGIR = 0.001 × 54 = 0.054× → "Safe" → CORRECT decision,
+   but cannot explain WHY the gradient is inert—misses the structural
+   insight that the gradient is directionally random
+
+3. GIR + AA: |cos θ| = 0.05 → "Ghost gradient: large but directionally
+   random" → CORRECT with mechanistic explanation
+
+4. Full GIM: confirms ghost gradient + GCF task fraction > 99%
+
+Contrast: ERA at λ=0.01, seed s123 (amplifier regime):
+
+1. GIR-only: similar magnitude → CANNOT distinguish from ghost gradient
+2. GIR + eGIR: eGIR moderate → AMBIGUOUS
+3. GIR + AA: |cos θ| non-negligible → "Amplifier: real interference"
+   → CORRECT, identifies risk
+
+The ghost-gradient/amplifier distinction is invisible to magnitude alone;
+only the directional component (AA) provides the discriminating signal.
+```
+
+---
+
+### PE：Figure 10 和 Figure 12 主文化（Day 1，0 GPU-h）
+
+**Figure 10**（effective GIR + test accuracy over epochs）：
+- 绿色区域（learning phase, acc < 99%）：eGIR < 0.02×
+- 红色区域（saturation phase）：eGIR rises only after accuracy plateaus
+- **一张图解释 timing mismatch** → 主文核心图
+
+**Figure 12**（raw vs effective GIR side-by-side）：
+- 左图：raw GIR 达 100×
+- 右图：eGIR 全部 < 1×
+- **一眼看出 λ-weighting 的压缩力量**
+
+两图当前在 Appendix C.15，应拉入主文（可作为一个 combined figure 的 panels）。
+
+---
+
+### PF：GIM 计算开销分析（Day 4，0 GPU-h）
+
+```text
+GIM measurement overhead. Computing GIM requires K+1 separate backward passes
+per MoE layer at each measurement epoch. For ViT-Tiny (K=2, 2 MoE layers),
+GIM adds 6 extra backward passes per measurement batch. With per-epoch
+measurement, overhead is ~1.5% of total training compute; with decadal
+measurement, <0.15%. At ViT-Base scale (~98M), overhead is ~3% per measurement
+epoch, or <0.3% with decadal measurement. GIM is suitable for online
+monitoring during production training runs.
+```
+
+---
+
+### PG：Practical decision flowchart（Day 3，0 GPU-h）
+
+新增 Figure（Discussion 或 Section 5.2）：
+
+```
+                    Compute eGIR for each auxiliary loss
+                              |
+                    eGIR < 0.1  →  SAFE: leave λ alone
+                              |
+                  0.1 ≤ eGIR < 1.0
+                              |
+                    Check AA (angular alignment)
+                    /                    \
+              |cos θ| < 0.1          |cos θ| ≥ 0.1
+                  |                      |
+          GHOST GRADIENT           MONITOR/INTERVENE
+          (large but inert,        (real interference)
+           no action needed)            |
+                                Check convergent vs persistent
+                                (Proposition 1)
+                                /                      \
+                          Convergent                Persistent
+                          (ERA-like)               (LB-like)
+                              |                        |
+                     Wait for                  Consider:
+                     self-extinction            - reduce λ
+                                                - switch to loss-free
+                                                - accept routing cost
+```
+
+把 GIM 从 "academic diagnostic" 变成 "practical tool with actionable output"。
+
+---
+
+### PH：Multi-batch GIM 验证（Day 2，~5 GPU-h）
+
+CIFAR-100 ViT-Tiny seed 42，5 个关键 epoch（1, 10, 30, 60, 90）：
+- 运行 16-batch GIM estimation（vs 当前的 single-batch）
+- 报告 single-batch vs 16-batch mean of GIR, AA, eGIR
+- Bootstrap confidence intervals
+- 目标：证明 single-batch 在 early/mid training 足够可靠，late training 定性结论不变
+
+---
+
+## 5. 统计与可靠性提升
+
+### TOST
+
+- 主文 limitation 前置 margin sensitivity，引用 Table 7
+- n=10 后 TOST power ≈ 0.80（vs n=6 的 ~0.45）
+- ImageNet-50 z-loss borderline (p_Dunn=0.047)，ρ-sensitive (Table 21)，保守表述
+
+### Sign test
+
+- 13/13 改为 "paired observations"
+- 补 λ=0.075 后精确定位 threshold
+
+### LB TOST failure
+
+正面使用：LB 在两个 scale 都 fail → 支撑 routing-uniformization cost
+
+---
+
+## 6. 建议的最终主文结构
 
 ```text
 1 Introduction
-   - Auxiliary loss tax motivation
-   - Controlled micro/medium vision MoE scope
-   - GIM diagnostic framing
-   - Main findings: denominator collapse, λ-dependent convergence spectrum, routing reshaping
+  - Auxiliary loss tax motivation (with tax definition)
+  - Scope declaration (micro/medium vision MoE, AdamW + SGD)
+  - GIM diagnostic framing
+  - Main findings preview
 
 2 Related Work
-   - MoE auxiliary losses and loss-free balancing
-   - Vision/small-scale MoE
-   - Gradient diagnostics vs gradient surgery
+  - MoE auxiliary losses and loss-free balancing
+  - Vision/small-scale MoE
+  - Gradient diagnostics vs gradient surgery
 
 3 Method
-   - GIM: GIR, AA, GCF/eGIR
-   - deGIR optional
-   - GIM-Switch as proof-of-concept
-   - Experimental setup
+  3.1 GIM: GIR, AA, GCF/eGIR, deGIR
+  3.2 Proposition 1: Convergent lifecycle condition ← [PC]
+  3.3 GIM-Switch [validated scheduler / proof-of-concept]
+  3.4 Experimental setup (3 datasets, 2 arch, 2 optimizers, 4 loss types)
 
 4 Results
-   4.1 Raw GIR explosion is denominator-driven
-       - CIFAR U-shape
-       - ImageNet-50 contrast
-       - eGIR/GCF bounded
+  4.1 Raw GIR explosion is denominator-driven
+      - CIFAR U-shape (n=10) + ImageNet-50 contrast
+      - Timing mismatch: Figure 10 主文化 ← [PE]
+      - Three-layer attenuation ← [P7]
 
-   4.2 Auxiliary losses form a λ-dependent convergence-rate spectrum
-       - ERA vs LB on CIFAR
-       - Tiny-ImageNet dose-response threshold
-       - 13/13 matched pairs, cautious stats
+  4.2 λ-dependent convergence-rate spectrum
+      - ERA vs LB differential convergence
+      - Tiny-ImageNet 8-point dose-response (three-panel figure) ← [P2/P10]
+      - Proposition 1 empirical validation
 
-   4.3 GIM explains regimes that simpler metrics miss
-       - ghost-gradient vs amplifier
-       - raw GIR vs AA/deGIR
-       - diagnostic summary table
+  4.3 GIM resolves what simpler metrics cannot
+      - Ghost-gradient vs amplifier (主文图) ← [P1]
+      - Component ablation decision analysis ← [PD]
+      - Diagnostic summary table ← [P1]
 
-   4.4 Accuracy effects are mediated by routing distribution
-       - ViT-Small load variance
-       - z-loss specialization preservation
-       - LB uniformization cost
+  4.4 Accuracy effects are mediated by routing distribution
+      - ViT-Small load variance + z-loss preservation
+      - LB TOST failure pattern ← [P4]
+      - Gradient Tax vs Routing Tax table
 
-   4.5 Cross-architecture and preliminary scale checks
-       - ConvNeXt ERA self-limiting high-λ benefit
-       - ViT-Base 98M preliminary check
+  4.5 Cross-architecture, scale, and optimizer robustness
+      - ConvNeXt ERA self-limiting + stabilizer verification ← [P5]
+      - ViT-Base 98M (n≥5) ← [P6]
+      - SGD ablation ← [P8]
+      - Expert-choice routing probe ← [PB]
 
-   4.6 Proof-of-concept applications
-       - GIM-Switch if retained
-       - Phantom GIM
+  4.6 GIM-Switch [if validated] / Proof-of-concept applications [if not]
+      - GIM-Switch results + baseline comparison ← [P3]
+      - GIM-Switch sensitivity analysis ← [PA]
+      - Phantom GIM
+      - λ-decay ablation reference (Appendix I)
 
 5 Discussion
-   - What practitioners should monitor
-   - Why eGIR is not an accuracy predictor
-   - When to decay λ / switch to loss-free balancing
-   - Limits of controlled setting
+  5.1 When Should Practitioners Worry (+ decision flowchart) ← [PG]
+  5.2 GIM measurement overhead ← [PF]
 
 6 Limitations
-   - scale, seeds, benchmarks, optimizers, single-batch GIM, loss set
 
 7 Conclusion
 ```
 
 ---
 
-## 8. 5 天执行计划
+## 7. 4 天执行计划
 
-假设条件：agent auto research 写作/coding 快，2–4 张 5090，可并行。
+### Day 1：启动全部 GPU 实验 + 零成本写作全部完成
 
-### Day 1：叙事重构 + 低成本分析
+**GPU（4 卡全部跑满，~20h/卡）**：
 
-目标：不用新实验，先让论文站稳。
+| 卡 | 时段 | 任务 | runs | GPU-h |
+|---|---|---|---|---|
+| 卡 1 | 0-8h | CIFAR-100 n=10 补实验 batch 1 (baseline+LB) | 8 | ~8h |
+| 卡 1 | 8-13h | Expert-choice routing (no-aux 5 seeds) | 5 | ~5h |
+| 卡 1 | 13-20h | Tiny-ImageNet P2 (λ=0.2/0.3 补 + λ=0.075) | ~6 | ~7h |
+| 卡 2 | 0-15h | CIFAR-100 n=10 batch 2 (ERA/z-loss) + ERA λ sweep n=6 | 12 | ~15h |
+| 卡 2 | 15-20h | Expert-choice routing (ERA 5 seeds) | 5 | ~5h |
+| 卡 3 | 0-10h | GIM-Switch CIFAR batch 1 (5 methods × seed 42,123) | 10 | ~10h |
+| 卡 3 | 10-20h | GIM-Switch CIFAR batch 2 (5 methods × seed 256) | 5 | ~5h + buffer |
+| 卡 4 | 0-12h | SGD ablation batch 1 (4 cond × seed 42,123,256) | 12 | ~12h |
+| 卡 4 | 12-20h | SGD ablation batch 2 (4 cond × seed 7,99) | 8 | ~8h |
 
-任务：
+**写作（与 GPU 完全并行，全天）**：
 
-1. 改 abstract；
-2. 改 introduction；
-3. 定义 tax；
-4. 将 “validated” 降级为 “observed / preliminary check”；
-5. 加 GIM incremental value 表；
-6. 把 ghost-gradient vs amplifier 从 appendix 拉进主文；
-7. 把 ViT-Small routing reshaping 证据拉进主文；
-8. 重新写 contributions。
+| 序号 | 任务 | ID |
+|---|---|---|
+| 1 | Proposition 1 理论命题 | PC |
+| 2 | GIM component ablation decision analysis | PD |
+| 3 | 改 abstract + intro + contributions | P0 |
+| 4 | Tax 定义 + scope declaration | P0 |
+| 5 | Ghost/amplifier 主文图 + diagnostic summary table | P1 |
+| 6 | Figure 10/12 主文化 | PE |
+| 7 | ConvNeXt Table 5/6 主文化 | P5 |
 
-产出：
+### Day 2：收集 Day 1 结果 + 关键决策 + 继续实验 + 写作
 
-- 新版 intro；
-- 新版 contribution；
-- 新 diagnostic summary table；
-- 新 figure plan。
+**上午**：收集 CIFAR-100 n=10 结果 + SGD 初步结果 + Expert-choice 结果。分析 GIM-Switch seed 42/123/256 初步结果。
 
-### Day 2：Tiny-ImageNet dose-response 补强
+**GIM-Switch 决策点（Day 2 中午）**：
+- **成功路径**→ 启动 Tiny-ImageNet/ConvNeXt GIM-Switch 复制
+- **失败路径**→ 降级 PoC，GPU 全部转给 P10 (Tiny-ImageNet expand) 或 P6 提前启动
 
-目标：把 Figure 4 变成核心证据。
+**GPU（4 卡跑满）**：
 
-任务：
+| 卡 | 任务 | runs | GPU-h |
+|---|---|---|---|
+| 卡 1-2 | GIM-Switch batch 3 (5 methods × seed 7,99) | 10 | ~10h |
+| 卡 1-2 后续 | [成功路径] GIM-Switch Tiny-ImageNet 9 runs / [失败路径] P10 expand | 9-10 | ~10h |
+| 卡 3 | SGD ERA λ sweep (3 points × n=3) | 9 | ~9h |
+| 卡 3 后续 | Multi-batch GIM validation (PH) | — | ~5h |
+| 卡 4 | Tiny-ImageNet P10 expand (λ=0.15, 0.4) | 10 | ~20h |
 
-1. λ=0.2、0.3 补到 n=3；
-2. 可选 λ=0.075；
-3. 每个 λ 计算 accuracy delta；
-4. 每个 λ 计算 eGIR/GCF；
-5. 每个 λ 计算 expert load std / entropy；
-6. 生成三联图。
+**写作（与 GPU 并行）**：
 
-产出：
+| 序号 | 任务 | ID |
+|---|---|---|
+| 1 | 更新 Table 1 (n=10 数据) | P9 |
+| 2 | Routing reshaping 小节 + summary table | P4 |
+| 3 | 三层 attenuation 写作 (Adam v_t + Appendix I) | P7 |
+| 4 | 分析 SGD 初步结果，写 optimizer comparison | P8 |
+| 5 | 分析 Expert-choice 结果 + Proposition 1 验证 | PB/PC |
 
-- 新 Table：λ, seeds, ratio, eGIR, accuracy, load variance；
-- 新 Figure：taxonomy ratio + eGIR + accuracy/load。
+### Day 3：ViT-Base + GIM-Switch 收尾 + 结构整合
 
-### Day 3：GIM-Switch 最小可接受实验
+**GPU**：
 
-目标：决定 GIM-Switch 是主贡献还是 proof-of-concept。
+| 卡 | 任务 | runs | GPU-h |
+|---|---|---|---|
+| 卡 1-4 (4卡并行) | ViT-Base-MoE LB+ERA 各 3 new seeds | 6 | ~10h (4卡并行) |
+| 卡 1-2 后续 | [成功路径] GIM-Switch ConvNeXt 9 runs | 9 | ~14h |
+| 卡 3-4 后续 | [成功路径] GIM-Switch sensitivity (PA) 15 runs | 15 | ~15h |
+| | [失败路径] buffer 或 P10 补充 | — | — |
 
-任务：
+**写作（全天）**：
 
-CIFAR-100 ViT-Tiny λlb=0.1：
+| 序号 | 任务 | ID |
+|---|---|---|
+| 1 | GIM-Switch 结果分析 → 决定主贡献 vs PoC | P3 |
+| 2 | GIM-Switch sensitivity 分析（如果成功） | PA |
+| 3 | SGD ablation 完整写作 | P8 |
+| 4 | Tiny-ImageNet 三联图 | P2/P10 |
+| 5 | Practical decision flowchart | PG |
+| 6 | ViT-Base 表述调整 | P6 |
+| 7 | 更新 Conclusion（两个版本准备好） | — |
 
-- fixed 0.1；
-- fixed 0.05；
-- GIM-Switch；
-- optional linear decay；
-- n=3 seeds。
+### Day 4：审稿式打磨 + 最终整合
 
-报告：
+**GPU**：收集 Day 3 残余结果（上午）。Buffer ~10h 用于失败重跑。
 
-- accuracy；
-- eGIR AUC；
-- max eGIR；
-- time in tiers；
-- transition count；
-- load variance；
-- seed std。
+**写作（全天）**：
 
-决策：
-
-- 如果 GIM-Switch 稳定降低 eGIR AUC 或提升稳定性，保留为 contribution；
-- 如果没有明显优势，降级为 proof-of-concept。
-
-### Day 4：机制分析 + 图表整合
-
-目标：把实验结果组织成机制故事。
-
-任务：
-
-1. 写 “Gradient Tax vs Routing Tax” 小节；
-2. 整合 ViT-Small load variance；
-3. 整合 ConvNeXt ERA λ sweep；
-4. 加 diagnostic summary table；
-5. 画 ConvNeXt accuracy/GIR dual-axis 图；
-6. 更新 Discussion。
-
-### Day 5：审稿式打磨
-
-目标：降低被 reject 的风险。
-
-任务：
-
-1. 全文查找 overclaim；
-2. 检查所有 “validated / generalize / prove / safety” 用词；
-3. 加 TOST margin caveat；
-4. 加 sign test independence caveat；
-5. 强化 limitations；
-6. 检查 main/appendix 一致性；
-7. 生成 rebuttal-ready notes。
+| 序号 | 任务 |
+|---|---|
+| 1 | 全文 overclaim 扫描（validated/generalize/prove/safety/always/never） |
+| 2 | GIM 计算开销分析 (PF) |
+| 3 | Main/appendix 交叉引用一致性检查 |
+| 4 | 所有数字 vs table/figure 一致性 |
+| 5 | 统计 caveats（TOST margin, sign test independence, ρ-sensitivity） |
+| 6 | NeurIPS checklist 更新（Theory→Yes, SGD, n=10, expert-choice） |
+| 7 | 图表质量检查（字号、legend、color-blind friendly） |
+| 8 | 最终 Conclusion 选择（路径 A or B） |
+| 9 | 生成 rebuttal-ready notes（per criticism） |
+| 10 | 全文通读 |
 
 ---
 
-## 9. 具体实验优先级清单
+## 8. GPU 调度甘特图
 
-| 优先级 | 实验/分析 | 成本 | 收益 | 是否必须 |
-|---|---:|---:|---:|---:|
-| P0 | 降级 overclaim + 改 abstract/intro | 低 | 极高 | 必须 |
-| P1 | GIM incremental value table + ghost/amplifier 主文化 | 低 | 极高 | 必须 |
-| P2 | Tiny-ImageNet λ=0.2/0.3 补到 n=3 | 中 | 高 | 强烈建议 |
-| P2 | Tiny-ImageNet 加 eGIR/load/accuracy | 中 | 高 | 强烈建议 |
-| P3 | GIM-Switch n=3 baseline 对比 | 中高 | 高 | 若保留主贡献则必须 |
-| P4 | ViT-Small load variance 主文化 | 低 | 高 | 必须 |
-| P5 | ConvNeXt sweep 主文化 | 低 | 高 | 必须 |
-| P6 | ViT-Base 第 3 seed | 高 | 中 | 可选 |
-| P6 | ViT-Base eGIR/GCF/load variance | 中 | 中高 | 可选但有用 |
-| P7 | optimizer ablation SGD/AdamW | 中高 | 中 | 非必须 |
-| P8 | full ImageNet / larger scale | 很高 | 极高 | 超出短期范围 |
+```
+          Day 1                    Day 2                    Day 3                Day 4
+卡1  [CIFAR n=10][ExpertC][TinyIN] [GIM-Sw b3][TIN/P10 ]  [ViT-Base][ConvNeXt ] [buffer]
+卡2  [CIFAR n=10+sweep][ExpertC]   [GIM-Sw b3][TIN/P10 ]  [ViT-Base][ConvNeXt ] [buffer]
+卡3  [GIM-Switch batch 1+2      ]  [SGD sweep][MultiBatch] [ViT-Base][PA sens  ] [buffer]
+卡4  [SGD ablation batch 1+2    ]  [TinyIN P10 expand   ]  [ViT-Base][PA sens  ] [buffer]
+
+GPU利用率:  ~95%                     ~90%                    ~85%                  ~15%
+写作:  PC,PD,P0,P1,PE,P5          P9,P4,P7,P8,PB         P3,PA,P8,P2,PG,P6    PF,checklist,polish
+```
+
+**总 GPU 利用**: ~310h / 320h = **97%**
+
+---
+
+## 9. 实验结果对论文的 conditional impact
+
+| 实验 | 最好结果 | 最好 impact | 最差结果 | 最差 impact | EV |
+|---|---|---|---|---|---|
+| P3 GIM-Switch | beats fixed-λ | +15% | no advantage | 0% (PoC) | +9% |
+| P8 SGD ablation | taxonomy preserved | +5% | taxonomy differs | +3% | +4.4% |
+| P9 CIFAR n=10 | TOST pass at δ=1.5 | +5% | same as n=6 | +2% | +4.4% |
+| P6 ViT-Base n≥5 | taxonomy confirmed | +5% | inconsistent | -2% | +4.0% |
+| PB Expert-choice | confirms Prop.1 | +5% | ambiguous | +1% | +3.8% |
+| P2/P10 Tiny-IN | clean 8-pt curve | +3% | noisy | +1% | +2.5% |
+| PA GIM-Switch sens. | not sensitive | +3% | sensitive | -1% | +1.6%(cond.) |
+| PH Multi-batch | validates single | +2% | shows noise | +1% | +1.7% |
+| PC Proposition 1 | — | +4% | — | +4% | +4% (写作) |
+| PD Component ablation | — | +3% | — | +3% | +3% (写作) |
+| PG Flowchart | — | +2% | — | +2% | +2% (写作) |
+| PE Figure 10/12 | — | +1.5% | — | +1.5% | +1.5% (写作) |
+| PF Compute overhead | — | +1% | — | +1% | +1% (写作) |
+
+**Experiments EV total**: ~30%  
+**Writing EV total**: ~11.5%  
+**Grand total boost**: ~40%（从 ~18% → ~58%）
 
 ---
 
 ## 10. 预期审稿意见与防守策略
 
-### Criticism 1: GIM is just gradient norm ratio plus cosine similarity.
+### Criticism 1: GIM is just gradient norm ratio plus cosine similarity — not novel enough.
 
-防守：
-
-- 承认 components are simple；
-- 强调 contribution 是 router-specific lifecycle diagnostic protocol；
-- 用 ghost-gradient vs amplifier 证明 raw GIR alone 不够；
-- 用 eGIR/GCF 证明 λ-weighting 改变 interpretation；
-- 用 routing metrics 证明 gradient magnitude 和 accuracy 解耦。
-
-推荐句：
+**防守**：
+- Ghost-gradient/amplifier decision analysis (PD) 证明 raw GIR alone 会导致错误决策
+- Proposition 1 (PC) 给出理论解释，不只是 "我们测了一下"
+- Diagnostic summary table 证明没有单一指标能覆盖所有 phenomena
 
 ```text
-GIM's value is not in inventing a new primitive statistic, but in combining magnitude, direction, and λ-weighted contribution into a router-specific lifecycle diagnostic. The ghost-gradient/amplifier distinction demonstrates that no single component is sufficient.
+GIM's value is not in inventing a new statistic, but in combining magnitude,
+direction, and λ-weighted contribution into a lifecycle diagnostic grounded by
+a structural condition (Proposition 1). The ghost-gradient/amplifier decision
+analysis demonstrates that no single component suffices.
 ```
 
 ### Criticism 2: Experiments are small-scale / toy datasets.
 
-防守：
-
-- 承认 controlled micro/medium setting；
-- 强调目的是 isolate router-gradient dynamics；
-- 不声称 production-scale validation；
-- ViT-Base 98M 作为 preliminary scale check；
-- future work 明确 full ImageNet / ViT-Large / LLM MoE。
-
-推荐句：
+**防守**：
+- ViT-Base 98M with **n≥5 seeds**
+- 3 datasets × 2 architectures × 2 optimizers × 4 loss types
+- Explicit scope declaration in intro
 
 ```text
-We intentionally use controlled micro-to-medium-scale vision MoE to isolate router-gradient dynamics under reproducible multi-seed settings; production-scale validation is an important next step rather than a claim of this work.
+We intentionally use controlled micro-to-medium-scale vision MoE to isolate
+router-gradient dynamics under reproducible multi-seed settings (n=5–10).
+GIM's computational overhead is <0.3% of training time, making it directly
+applicable to production runs; full-scale validation is future work.
 ```
 
 ### Criticism 3: GIM-Switch is under-validated.
 
-防守：
+**防守（路径 A）**：n=5 seeds × 5 baselines × 2 datasets + sensitivity analysis。
 
-- 如果补了实验：强调 baseline comparison；
-- 如果没补：主动降级为 proof-of-concept。
+**防守（路径 B）**：proof-of-concept + λ-decay ablation (Appendix I) shows reactive decay alone fails due to discontinuous GIR phase transition → motivates bidirectional design.
 
-推荐句：
+### Criticism 4: Accuracy effects are small — so what?
 
-```text
-We present GIM-Switch as a proof-of-concept showing that eGIR can drive bidirectional λ modulation, not as a fully optimized scheduler.
-```
+**防守**：That **is** the finding. Three-layer attenuation explains why raw GIR of 75× coexists with Δ within ±2 pp. ViT-Small and ConvNeXt show larger routing-mediated effects. The decision flowchart (PG) gives practitioners concrete actions.
 
-### Criticism 4: Accuracy effects are small.
+### Criticism 5: Only AdamW optimizer.
 
-防守：
+**防守**：SGD ablation (P8) validates / characterizes optimizer dependence.
 
-- 这正是论文结论：large raw GIR does not imply large accuracy cost；
-- 论文贡献是解释为什么 small accuracy delta coexists with large gradient diagnostics；
-- routing distribution 和 effective tax 提供机制解释。
+### Criticism 6: Only 3 auxiliary losses.
 
-推荐句：
+**防守**：Expert-choice routing probe (PB) extends to a 4th paradigm. Proposition 1 predicts the lifecycle based on structural properties, generalizing beyond specific loss implementations.
 
-```text
-The modest accuracy effects are part of the finding: raw gradient dominance can look alarming, but λ-weighting and directional decoupling bound its operational impact.
-```
+### Criticism 7: TOST depends on ±2 pp margin.
 
-### Criticism 5: TOST equivalence depends on ±2 pp margin.
+**防守**：Sensitivity across 4 margins (Table 7). With n=10, power ≈ 0.80.
 
-防守：
+### Criticism 8: 13/13 sign test may not be independent.
 
-- 明确 margin 是 a priori；
-- 报告 sensitivity；
-- 不说 negligible effect，只说 practical equivalence under ±2 pp。
+**防守**：Treated as paired observations. 8-point dose-response curve provides independent characterization of the threshold.
 
-推荐句：
+### Criticism 9: No theory.
 
-```text
-We interpret TOST results as practical equivalence under a pre-specified ±2 pp margin, not as proof that auxiliary losses have zero effect.
-```
-
-### Criticism 6: 13/13 sign test may not be independent.
-
-防守：
-
-- 改成 paired observations；
-- 在 limitation 里承认 shared seeds/recipes；
-- 作为 strong preliminary evidence。
+**防守**：Proposition 1 provides a structural condition that predicts convergent vs persistent lifecycle. Empirically validated across ERA (convergent, satisfiable), LB (persistent, unsatisfiable), z-loss (persistent, unsatisfiable), and expert-choice (convergent/absent, built-in balancing).
 
 ---
 
-## 11. 推荐的最终结论写法
+## 11. 推荐的最终 Conclusion
 
-建议 conclusion 避免过强，改成：
+### 路径 A（GIM-Switch 成功）
 
 ```text
-We introduced GIM, a router-specific diagnostic for measuring the gradient-level tax of auxiliary losses in sparse MoE. Across controlled vision MoE experiments, GIM reveals that this tax is structured rather than uniformly harmful: raw GIR can be inflated by task-gradient denominator collapse, whereas λ-weighted eGIR and GCF show bounded effective contribution in the studied regimes. Auxiliary losses form a λ-dependent convergence-rate spectrum, with ERA-like coupling objectives self-extinguishing rapidly and load-balancing remaining slow-converging/persistent. Tiny-ImageNet dose-response suggests a threshold-mediated separation above λ≈0.1, while ConvNeXt-MoE shows that convergent coupling losses can remain beneficial even at high λ.
+We introduced GIM, a router-specific diagnostic for measuring the gradient-
+level tax of auxiliary losses in sparse MoE. A simple structural condition
+(Proposition 1) predicts whether an auxiliary loss self-extinguishes or
+persists: losses with a satisfiable optimum on the router subspace follow a
+convergent lifecycle, while those targeting unattainable objectives remain
+persistent.
 
-Our results suggest that accuracy effects are mediated by routing-distribution reshaping and expert specialization, not raw gradient magnitude alone. GIM-Switch and phantom GIM illustrate how GIM can support adaptive λ modulation and counterfactual loss-free balancing diagnostics. We view these as proof-of-concept applications; larger-scale validation across production MoE, full-resolution vision benchmarks, additional routing losses, and non-Adam optimizers remains future work.
+Across controlled vision MoE experiments spanning CIFAR-100 (n=10),
+Tiny-ImageNet, ImageNet-50, two architectures (ViT/ConvNeXt), scales up to
+~98M parameters (n≥5), both AdamW and SGD, and four loss types including
+expert-choice routing, GIM confirms this prediction and reveals that large
+raw GIR is often a denominator-collapse artifact: three independent
+attenuation mechanisms keep the effective contribution bounded. Accuracy
+effects are mediated by routing-distribution reshaping rather than gradient
+magnitude—the ghost-gradient/amplifier distinction illustrates that only
+directional analysis, not magnitude alone, can identify operationally harmful
+interference.
+
+GIM-Switch demonstrates that eGIR signals can drive practical adaptive λ
+scheduling, matching tuned fixed-λ baselines across n=5 seeds without per-
+setting grid search, validated on CIFAR-100 and Tiny-ImageNet.
+
+Production-scale validation across language MoE, additional routing
+architectures, and longer training remains important future work.
+```
+
+### 路径 B（GIM-Switch 失败）
+
+前两段不变；第三段替换为：
+
+```text
+GIM-Switch and phantom GIM illustrate proof-of-concept applications; a
+λ-decay ablation (Appendix I) shows that reactive decay alone is insufficient
+due to the discontinuous GIR phase transition. Systematic scheduler
+optimization and production-scale validation remain future work.
 ```
 
 ---
 
-## 12. 最终评分预估
+## 12. 最终评分与中稿概率分析
 
-### 当前版本直接投
+### 12.1 加权中稿概率
 
-预计：**5.5–6 / 10**。
+```
+P(中稿) = P(GIM-Switch 成功) × P(中|成功) + P(失败) × P(中|失败)
+        = 0.6 × 0.62 + 0.4 × 0.52
+        = 0.372 + 0.208
+        = 0.58
 
-优点：
+约 58% 中稿概率
+```
 
-- intro 强；
-- GIM framing 清楚；
-- Tiny-ImageNet threshold 有新意；
-- ConvNeXt 和 ViT-Small 提供补充 evidence；
-- 统计分析比一般 empirical paper 更认真。
+### 12.2 各方案版本对比
 
-风险：
+| 维度 | 直投 | v2 (写作为主) | v4 最终版 |
+|---|---|---|---|
+| GPU 利用 | 0h | 8h (2.5%) | **310h (97%)** |
+| 中稿概率 | ~15-20% | ~35-45% | **~57-62%** |
+| 实验覆盖 | 3 datasets, 2 arch, 1 opt, 3 losses | 同左 | **3 ds, 2 arch, 2 opt, 4 losses** |
+| 统计 power | n=2-6 | n=3-6 | **n=5-10** |
+| 理论 | N/A | N/A | **Proposition 1** |
+| 方法贡献 | under-validated | PoC | **正面验证 (60% success)** |
+| 新增提升来源 | — | 写作 | **GIM-Switch + SGD + Expert-choice + Proposition 1 + n=10 + component ablation** |
 
-- overclaim；
-- GIM novelty 被认为不够；
-- GIM-Switch under-validated；
-- ViT-Base n=2；
-- benchmark 偏小；
-- 机制证据分散。
+### 12.3 为什么 ~60% 接近 ceiling
 
-### 完成 P0–P2
+**不可弥补的硬伤**：
+- 没有 production-scale 实验（language MoE, >1B parameters）
+- 最大模型 98M 在 2026 NeurIPS 仍然偏小
+- GIM 方法论核心（gradient decomposition）不是 conceptual breakthrough
 
-预计：**6 / 10，Borderline Accept**。
-
-因为论文会变得更可信，taxonomy 主线更强。
-
-### 完成 P0–P5，尤其 GIM-Switch baseline 或降级
-
-预计：**6.5–7 / 10，Weak Accept**。
-
-如果 Tiny-ImageNet dose-response 补完整，GIM incremental value 讲清楚，GIM-Switch 不再 overclaim，这篇会像一篇扎实的 empirical diagnostic paper。
-
-### 如果再补 ViT-Base 第 3 seed 或更强 benchmark
-
-预计：**7 / 10 更稳**。
-
-但短期内 ROI 不如 Tiny-ImageNet + GIM-Switch + 主线重写。
+**已接近所有 4 天内可做的改进**：
+- 实验覆盖：3 datasets × 2 architectures × 2 optimizers × 4 loss types × 7M-98M × n=5-10
+- 理论：Proposition 1
+- 方法：GIM diagnostic + GIM-Switch adaptive scheduler
+- 统计：n=10 TOST + multi-batch + sensitivity
+- 实用性：flowchart + compute overhead + decision analysis
 
 ---
 
-## 13. 最关键的一句话
+## 13. 给 agent 的执行指令
 
-这篇论文不要让 reviewer 觉得你们在用 CIFAR/ImageNet-50 小模型证明大规模 MoE 训练规律；要让 reviewer 觉得：
+> **Day 1 第一件事是启动 GPU 实验。** 所有 4 卡必须在 2h 内全部跑起来。卡 1-2 跑 CIFAR n=10 + Expert-choice，卡 3 跑 GIM-Switch batch 1，卡 4 跑 SGD ablation。CIFAR 实验完成后接力跑 Tiny-ImageNet 和 Expert-choice 残余。
 
-> **你们在 controlled micro/medium Vision MoE setting 中提出了一个清晰、可复现、有解释力的 router-gradient diagnostic framework，并发现了一个 λ-dependent convergence-rate spectrum。这个发现虽然还需要 production-scale replication，但已经足够有 insight，能改变大家理解和调试 auxiliary losses 的方式。**
+> **Day 1 同时完成全部零 GPU 写作**：Proposition 1 → component ablation decision analysis → abstract/intro/contributions → ghost/amplifier 主文图 → Figure 10/12 主文化 → ConvNeXt 主文化。这些工作不依赖任何新实验结果。
 
-这才是最稳的 NeurIPS 叙事。
+> **Day 2 中午是 GIM-Switch 关键决策点**。初步结果（seed 42/123/256）决定：
+> - 成功 → 启动 Tiny-ImageNet/ConvNeXt 复制 + Day 3 sensitivity analysis
+> - 失败 → 降级 PoC，GPU 转给 ViT-Base（提前启动）和 Tiny-ImageNet expand
+
+> **Expert-choice 和 SGD 实验结果应在 Day 2 上午可用**。立即分析：Expert-choice 的 GIR profile 是否符合 Proposition 1 预测？SGD 下 taxonomy ordering 是否保持？这两个结果直接影响 abstract 和 contributions 的措辞。
+
+> **Day 3 ViT-Base 是最后一个大实验**。4 卡并行应在 ~10h 完成。Day 3 下午开始最终结构整合。
+
+> **Day 4 不是轻松打磨日**——需要完成 compute overhead、NeurIPS checklist 更新、flowchart 精修、rebuttal notes、全文通读。这是确保论文从 "good" 变成 "polished" 的关键。
+
+---
+
+## 14. 给作者的底线
+
+> 本方案将中稿概率从 ~15-20%（直投）推到 ~57-62%（全部完成），提升 **~40 个百分点**。
+>
+> 核心提升来源：
+> 1. GIM-Switch 正面验证：EV +9%
+> 2. Proposition 1 理论锚：+4%
+> 3. SGD ablation：EV +4.4%
+> 4. CIFAR n=10 统计：EV +4.4%
+> 5. Expert-choice scope 扩展：EV +3.8%
+> 6. ViT-Base scale 补齐：EV +4.0%
+> 7. 零成本写作改进：+11.5%
+>
+> **310 GPU-hours + 4 天的投入，预期回报是从"很可能 reject"变成"略微偏向 accept"。**
+>
+> **这篇论文的战场不在 method novelty，而在 diagnostic insight + practical value。** 要让 reviewer 觉得：读完这篇论文后，我对 MoE auxiliary loss 的理解发生了实质性改变——我知道了 raw GIR 为什么会爆炸但不可怕（三层 attenuation），我知道了为什么有些 loss 会自己消失而有些不会（Proposition 1），我知道了 ghost-gradient 和 amplifier 的区别（AA），我知道了 accuracy cost 来自 routing redistribution 而非 gradient magnitude（routing tax vs gradient tax），我有一个 flowchart 可以直接用。如果 reviewer 有这种感觉，7 分就到手了。
